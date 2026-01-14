@@ -1,0 +1,41 @@
+# Graph_RWS/configs/amazon_computer.yaml
+
+dataset:
+  source: dgl
+  module: dgl.data
+  class: AmazonCoBuyComputerDataset
+  root: ./dataset
+
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+use_baps: True
+# 节点数较少 (1.3w)，分区主要是为了测试代码
+num_partitions: 10
+batch_partition_size: 2
+
+sampling: true
+batch_size: 1024
+
+fanouts: [10, 10]
+hidden_size: 128
+num_classes: 10
+dropout: 0.5
+residual: true
+normalize_features: true
+
+epochs: 200
+lr: 0.005
+weight_decay: 5e-4
+eval_interval: 5
+patience: 50
+use_scheduler: true
+
+use_uva: false
+use_checkpoint: false
+save_model: false
+save_path: Graph_RWS/save_models/
+save_result: false
+result_path: Graph_RWS/results/
+use_dynamic_bcsr: false

@@ -1,0 +1,54 @@
+# Graph_RWS/configs/citeseer.yaml
+# Citeseer dataset config for Pure-BCSR training
+# 特点：节点少 (3327)，但特征维数高 (3703)，存在孤立点
+
+# 数据源设置
+dataset:
+  source: dgl
+  module: dgl.data
+  class: CiteseerGraphDataset  # DGL 类名
+  kwargs: {verbose: False}     # 关闭冗余日志
+  feature_key: feat
+  label_key: label
+  train_mask_key: train_mask
+  val_mask_key: val_mask
+  test_mask_key: test_mask
+
+# BCSR 结构参数
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+use_baps: false
+
+# GNN 模型超参数
+# Citeseer 比较稀疏，[20, 10] 的采样策略能较好覆盖局部邻域
+fanouts: [50, 50]
+hidden_size: 256          # 输入特征是 3703 维，使用 256 维隐藏层能保留更多信息
+num_classes: 6            # Citeseer 有 6 个类别
+dropout: 0.5              # 防止过拟合
+residual: false           # 浅层网络 (2层) 不需要残差
+normalize_features: true
+
+# 训练参数
+epochs: 200
+lr: 0.005
+weight_decay: 0.0005      # 经典的 GCN 正则化参数
+eval_interval: 5
+patience: 50             # 给予充足的收敛耐心
+use_scheduler: true
+
+# 显存优化开关
+use_uva: false             # 开启 UVA：特征在 CPU，按需传输
+use_checkpoint: false      # 开启 Checkpoint：以计算换显存
+use_rcm: false
+
+# 保存设置
+save_model: false
+save_path: Graph_RWS/save_models/
+save_result: false
+result_path: Graph_RWS/results/
+
+# 采样设置
+sampling: true
+batch_size: 512           # Citeseer 很小，512 的 Batch Size 可以兼顾随机性和速度

@@ -1,0 +1,59 @@
+# Graph_RWS/configs/cora.yaml
+# Cora dataset config for Pure-BCSR training
+
+# 数据源（使用 DGL 下载 Cora 后立即转换为 BCSR）
+dataset:
+  source: dgl
+  module: dgl.data
+  class: CoraGraphDataset
+  kwargs: {verbose: False}
+  feature_key: feat
+  label_key: label
+  train_mask_key: train_mask
+  val_mask_key: val_mask
+  test_mask_key: test_mask
+
+# BCSR 结构参数
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+use_baps: false
+
+# 采样设置
+# 全图训练设为 false; 启用采样设为 true
+sampling: false
+batch_size: 1024
+
+# GNN 模型超参
+# fanouts 的长度用于推导 num_layers = len(fanouts)
+fanouts: [32, 10]
+hidden_size: 16
+dropout: 0.5
+residual: false
+normalize_features: true
+
+# 训练设置
+epochs: 200
+lr: 0.01
+weight_decay: 0.0005
+eval_interval: 2
+patience: 50
+use_scheduler: true
+
+# 显存优化开关
+use_uva: false             # 开启 UVA：特征在 CPU，按需传输
+use_checkpoint: false      # 开启 Checkpoint：以计算换显存
+use_rcm: true
+
+# 是否保存模型
+save_model: false
+# 模型保存路径
+save_path: Graph_RWS/save_models/
+
+# 是否保存结果
+save_result: false
+# 结果保存路径
+result_path: Graph_RWS/results/
+
+use_dynamic_bcsr: false

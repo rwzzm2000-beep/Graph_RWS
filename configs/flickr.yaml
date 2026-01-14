@@ -1,0 +1,57 @@
+# Graph_RWS/configs/flickr.yaml
+# Flickr dataset config for Pure-BCSR training
+# 来源: GraphSAINT 论文
+# 规模: ~89K 节点, ~900K 边, 500维特征, 7类别
+
+# 数据源设置
+dataset:
+  source: dgl
+  module: dgl.data
+  class: FlickrDataset       # DGL 内置数据集类名
+  kwargs: {verbose: False}   # 关闭 DGL 加载时的详细日志
+  feature_key: feat
+  label_key: label
+  train_mask_key: train_mask
+  val_mask_key: val_mask
+  test_mask_key: test_mask
+
+# BCSR 结构参数
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+use_baps: false
+
+# 采样与训练设置
+sampling: false
+# Flickr 比较稠密，4096 或 8192 的 Batch Size 能提供较好的随机梯度
+batch_size: 4096
+
+# GNN 模型超参数
+# Flickr 图结构较稠密（平均度约 10），且属于“易学”的数据集
+# 2 层 GCN 通常就足够了，深层网络收益不大
+fanouts: [50, 25]
+hidden_size: 256          # 500维输入 -> 256维隐藏层 -> 7类输出
+num_classes: 7
+dropout: 0.5
+residual: false           # 2层网络不需要残差连接
+normalize_features: true
+
+# 训练参数
+epochs: 200
+lr: 0.001                  # 经典 GCN 学习率
+weight_decay: 0.0005      # 适度正则化，防止过拟合
+eval_interval: 10          # 每 5 轮验证一次
+patience: 50              # Early Stopping 耐心
+use_scheduler: false
+
+# 显存优化开关
+use_uva: false             # 开启 UVA：特征在 CPU，按需传输
+use_checkpoint: false      # 开启 Checkpoint：以计算换显存
+use_rcm: true
+
+# 保存设置
+save_model: false
+save_path: Graph_RWS/save_models/
+save_result: false
+result_path: Graph_RWS/results/

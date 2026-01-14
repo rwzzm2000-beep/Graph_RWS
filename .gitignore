@@ -1,0 +1,38 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual env / env files
+.env
+.venv/
+venv/
+
+# ---------- Data & experiment artifacts ----------
+data/
+results/
+save_models/
+
+# ---------- Build artifacts (C/C++/Python extensions) ----------
+core/build/
+build/
+dist/
+*.o
+*.so
+*.a
+*.dll
+*.dylib
+*.egg-info/
+*.eggs/
+
+# ---------- Logs & temp ----------
+*.log
+tmp/
+temp/
+temp.py
+
+# ---------- IDE / OS ----------
+.vscode/
+.idea/
+.DS_Store
+

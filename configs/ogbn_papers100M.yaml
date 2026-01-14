@@ -1,0 +1,52 @@
+# Graph_RWS/configs/ogbn_papers100M.yaml
+
+# 1. 数据源
+dataset:
+  source: ogb
+  name: ogbn-papers100M
+  root: ./dataset
+
+# 2. BCSR 结构 (保持对齐)
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+# 3. BAPS 核心配置
+use_baps: True
+# 1.1亿节点 / 5000 ≈ 2.2万节点/分区。这个粒度对 GPU 非常友好。
+num_partitions: 5000
+# 每次训练 5 个分区 (约 10万节点)。根据 24G 显存情况，可尝试上调至 10。
+batch_partition_size: 5
+
+# 旧参数 (不生效但保留)
+sampling: true
+batch_size: 4096
+
+# 4. GNN 模型
+# 100M 数据集通常较浅层网络即可，深层极难收敛
+fanouts: [10, 10, 5]
+hidden_size: 128       # 显存紧缺时可降为 64
+num_classes: 172
+dropout: 0.1           # 大数据通常不需要太大的 Dropout
+residual: true         # 必须开启
+normalize_features: false # OGB Papers100M 特征通常已经预处理过，但也可用 True 尝试
+
+# 5. 训练设置
+epochs: 100            # 大数据收敛极慢，按需调整
+lr: 0.001              # 较小的学习率保证稳定
+weight_decay: 0.0
+eval_interval: 1       # 验证极其耗时，建议每 epoch 测一次或更久
+patience: 20
+use_scheduler: true
+
+# 6. 显存优化
+use_uva: true
+use_checkpoint: true   # 强烈建议开启，用计算换显存
+
+# 7. 保存
+save_model: true
+save_path: Graph_RWS/save_models/
+save_result: true
+result_path: Graph_RWS/results/
+
+use_dynamic_bcsr: false

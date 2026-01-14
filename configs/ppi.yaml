@@ -1,0 +1,44 @@
+# Graph_RWS/configs/ppi.yaml
+
+dataset:
+  source: dgl
+  name: ppi  # 代码中需特殊处理这个名字
+  root: ./dataset
+
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+use_baps: True
+# PPI 共有 24 张图 (20 Train + 2 Val + 2 Test)
+# 我们将在代码中把它们合并成一张大图。
+# 建议切分为 24 或 48，让 METIS 顺着原本的图边界切。
+num_partitions: 24 
+batch_partition_size: 4 # 每次训练 4 张原图的大小
+
+sampling: true
+batch_size: 2048
+
+# PPI 是多标签分类，Sigmoid + BCELoss (代码需适配)
+# 且 PPI 常用 3 层网络，隐层较大
+fanouts: [25, 10]
+hidden_size: 512    # PPI 常用 512 或 1024
+num_classes: 121
+dropout: 0.2
+residual: true
+normalize_features: true
+
+epochs: 400
+lr: 0.005
+weight_decay: 0.0
+eval_interval: 5
+patience: 100
+use_scheduler: true
+
+use_uva: false
+use_checkpoint: false
+save_model: true
+save_path: Graph_RWS/save_models/
+save_result: true
+result_path: Graph_RWS/results/
+use_dynamic_bcsr: false

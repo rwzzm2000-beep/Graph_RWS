@@ -1,0 +1,83 @@
+# Graph_RWS/configs/ogbn_arxiv.yaml
+
+# ================= [1. 基础环境与数据集] =================
+dataset:
+  source: ogb
+  name: ogbn-arxiv
+  root: ./dataset
+
+# BCSR 结构参数
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+# ================= [2. 训练模式控制] =================
+# 可选模式: 'DPS' | 'DAPS' | 'node' | 'full'
+train_mode: node
+
+# ================= [3. 预处理策略配置] =================
+# 预处理模式: 'rcm' | 'metis' | 'none'
+# - rcm: 使用 Reverse Cuthill-McKee 算法重排序 (适合 Node 模式，提升缓存命中)
+# - metis: 使用 METIS 图分割重排序 (适合 BAPS/DPS 模式，也可用于 Node 模式对比)
+# - none: 不进行预处理 (使用原始图 ID)
+preprocess_mode: rcm 
+
+# METIS 专用参数 (仅当 preprocess_mode: metis 时生效)
+metis:
+  num_partitions: 100
+
+# ================= [4. 模式专用配置板块] =================
+
+# [Mode: DPS] 动态分区采样配置
+DPS:
+  # Arxiv 图较小 (约170k节点, 1.2M边)，通常 RCM 足够，METIS 不是必须的
+  use_metis: false       
+  
+  # 1. 动态负载均衡参数 
+  # Arxiv 总边数仅 100万+，设置 20万边作为一个 Partition 比较合理
+  max_partition_edges: 200000 
+  
+  # 2. 探测步长
+  probe_step_size: 20
+
+  # 3. 策略选择
+  # 选项: 'seed_increment' | 'induced_growth'
+  strategy: induced_growth
+
+# [Mode: DAPS] 动态块对齐分区配置
+DAPS:
+  num_partitions: 10      # 宏观分区数量 (图小，分10份足够)
+  batch_partition_size: 5 # 每次训练的分区数
+
+# [Mode: node] 点采样配置
+node:
+  batch_size: 8192
+
+# [Mode: full] 全图训练配置
+full:
+  pass
+
+# ================= [4. GNN 模型结构] =================
+fanouts: [15, 10, 5]       # Arxiv 引用链较长，通常使用 3 层
+hidden_size: 128           # 常用配置 (原配置128，256通常效果更好)
+num_classes: 40
+dropout: 0.5
+residual: true
+normalize_features: true
+
+# ================= [5. 训练超参数] =================
+epochs: 100
+lr: 0.001
+weight_decay: 5e-4
+patience: 50
+eval_interval: 5
+use_scheduler: true
+
+# ================= [6. 系统与保存设置] =================
+use_uva: false             # Arxiv 数据量小，完全放得下 GPU，不需要 UVA
+use_checkpoint: false
+
+save_model: true
+save_path: Graph_RWS/save_models/
+save_result: true
+result_path: Graph_RWS/results/

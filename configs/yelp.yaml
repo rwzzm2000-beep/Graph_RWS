@@ -1,0 +1,53 @@
+# Graph_RWS/configs/yelp.yaml
+
+# ================= [1. 基础环境与数据集] =================
+dataset:
+  source: dgl
+  name: yelp
+  root: ./dataset
+
+# BCSR 结构参数
+tile_rows: 16
+tile_cols: 8
+warps_per_block: 8
+
+# ================= [2. 采样模式控制] =================
+sampling: true
+sampling_mode: dps_online
+use_baps: true             # 70w 节点，建议使用 METIS
+
+# ================= [3. 模式专用参数] =================
+# [Mode: DPS]
+dps_seed_budget: 15        # 图较稀疏，增加种子数以保证子图大小
+
+# [Mode: BAPS]
+num_partitions: 200        # 70w / 200 ≈ 3500
+batch_partition_size: 20
+
+# [Mode: Point]
+batch_size: 8192
+
+# ================= [4. GNN 模型结构] =================
+fanouts: [10, 10]
+hidden_size: 128
+num_classes: 100           # 多标签分类: 100 类
+dropout: 0.1
+residual: true
+normalize_features: true
+
+# ================= [5. 训练超参数] =================
+epochs: 200
+lr: 0.001
+weight_decay: 5e-4
+patience: 50
+eval_interval: 5
+use_scheduler: true
+
+# ================= [6. 系统与保存设置] =================
+use_uva: false
+use_checkpoint: false
+
+save_model: false
+save_path: Graph_RWS/save_models/
+save_result: false
+result_path: Graph_RWS/results/
