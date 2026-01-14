@@ -36,3 +36,4 @@ temp.py
 .idea/
 .DS_Store
 
+.ssh_local/
