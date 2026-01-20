@@ -52,6 +52,10 @@ DPS:
   strategy: induced_growth
   # ------------------------------------
 
+# [HACS] 重要性采样 (DPS 专用, 其他参数使用默认值)
+HACS:
+  enabled: true
+
 # [Mode: DAPS] 动态块对齐分区配置 (原 BAPS)
 DAPS:
   batch_partition_size: 20 # 每次训练的分区数

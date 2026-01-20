@@ -4,6 +4,7 @@ import time
 import argparse
 import warnings
 import json
+import random
 
 # 忽略 outdated 库的警告
 warnings.filterwarnings("ignore", category=UserWarning, module="outdated")
@@ -136,10 +137,10 @@ def main():
     # 5. 更新局部变量引用
     features = bundle.features
     
-    # 6. 清理不再需要的 SuperMap (DPS 预处理产物)
-    if hasattr(bundle, 'super_map') and bundle.super_map is not None:
-        # Index-Based 模式下，训练阶段不需要 SuperMap，为了省内存可以清理或移到 CPU
-        bundle = bundle._replace(super_map=None)
+    # # 6. 清理不再需要的 SuperMap (DPS 预处理产物)
+    # if hasattr(bundle, 'super_map') and bundle.super_map is not None:
+    #     # Index-Based 模式下，训练阶段不需要 SuperMap，为了省内存可以清理或移到 CPU
+    #     bundle = bundle._replace(super_map=None)
 
     # [Debug] 检查特征矩阵
     print(f"\n[Debug] Checking features for NaN/Inf...")
@@ -204,23 +205,45 @@ def main():
 
     # 只有 DPS 和 BAPS 需要 train_bool_mask 来过滤子图
     if train_mode in ['DPS', 'BAPS']:
-        # [Modified] Index-Based Storage 适配逻辑
-        # 现在的 features 是原始大小 (N_orig)，而不是膨胀后的 SuperGraph 大小
-        
         num_orig_nodes = bundle.features.shape[0]
         train_bool_mask = torch.zeros(num_orig_nodes, dtype=torch.bool, device=device)
-        
-        if train_mode == 'DPS' and hasattr(bundle, 'super_map') and bundle.super_map is not None:
-            # 关键修正：DPS 模式下的 bundle.train_idx 是 SuperGraph 的索引
-            # 我们需要利用 super_map 将其映射回 Global ID 才能生成正确的 Mask
-            # super_map 在 CPU，train_idx 在 GPU，需同步设备
-            super_map_dev = bundle.super_map.to(device)
-            global_train_idx = super_map_dev[bundle.train_idx]
-            train_bool_mask[global_train_idx] = True
-            del super_map_dev # 省显存
+
+        print("[Probe] has super_map:", hasattr(bundle, "super_map"))
+        print("[Probe] super_map is None:", (getattr(bundle, "super_map", None) is None))
+        print("[Probe] train_idx len:", len(bundle.train_idx))
+
+        # 关键：无论哪种模式，都定义一个“global_train_idx”
+        global_train_idx = None
+
+        if train_mode == "DPS":
+            # DPS 正确做法：train_idx(=super id) -> super_map -> global id
+            if getattr(bundle, "super_map", None) is None:
+                # 这里说明你的 super_map 在更早的地方已经被清掉了（或压根没加载出来）
+                # 临时兜底：把 train_idx 当作 global id（不一定正确，但至少不会崩）
+                print("[Warning] bundle.super_map is None in DPS; fallback to using train_idx as global id (may be WRONG).")
+                global_train_idx = bundle.train_idx.to(device)
+            else:
+                super_map_dev = bundle.super_map.to(device)
+                global_train_idx = super_map_dev[bundle.train_idx.to(device)]
+                del super_map_dev
         else:
-            # BAPS 或 旧版 DPS (bundle.train_idx 已经是 Global ID)
-            train_bool_mask[bundle.train_idx] = True
+            # BAPS：一般 train_idx 就是 global id
+            global_train_idx = bundle.train_idx.to(device)
+
+        # 真正置 mask
+        train_bool_mask[global_train_idx] = True
+
+        # ===== Probe（一定要放在置 mask 之后）=====
+        true_cnt = int(train_bool_mask.sum().item())
+        print("[Probe] train_bool_mask True count:", true_cnt)
+
+        hit = train_bool_mask[global_train_idx].float().mean().item()
+        print(f"[Probe] hit ratio on global_train_idx = {hit:.4f}")  # 应该 1.0000
+        # ==========================================
+
+        # 用完再清理 super_map（可选，省内存）
+        bundle = bundle._replace(super_map=None)
+
 
     if train_mode == 'DPS':
         print(f"[DPS_STATIC] Initializing Partition Loader...")

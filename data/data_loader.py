@@ -30,6 +30,10 @@ class DataBundle(NamedTuple):
     num_classes: int
     partition_book: Any = None
     super_map: Any = None  # 存储 SuperGraph ID -> Original Global ID 的映射
+    static_scores: torch.Tensor = None
+    window_part_ids: torch.Tensor = None
+    part_ranges: torch.Tensor = None
+    hacs_enabled: bool = False
 
 
 class WindowWiseDataLoader:
@@ -219,7 +223,56 @@ def require_module(mod: str, hint: str):
         raise ImportError(f"Missing optional dependency '{mod}'. {hint}") from e
 
 
-def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx, test_idx, device):
+def _parse_hacs_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    hacs_cfg = config.get('HACS')
+    if hacs_cfg is None:
+        hacs_cfg = config.get('hacs')
+    if hacs_cfg is None:
+        dps_cfg = config.get('DPS', {})
+        hacs_cfg = dps_cfg.get('HACS') or dps_cfg.get('hacs') or {}
+    return hacs_cfg or {}
+
+
+def _compute_hacs_static_scores(features: torch.Tensor,
+                                degrees: torch.Tensor,
+                                q_min: float,
+                                q_max: float,
+                                eps: float) -> torch.Tensor:
+    feats = features.to(dtype=torch.float32)
+    degs = degrees.to(device=feats.device, dtype=torch.float32)
+    denom = torch.log(degs + 2.0).clamp(min=1e-6)
+    q_raw = feats.norm(p=2, dim=1) / denom
+    q_mean = q_raw.mean()
+    q_norm = q_raw / (q_mean + eps)
+    return torch.clamp(q_norm, q_min, q_max).to(dtype=torch.float32)
+
+
+def _build_part_ranges(partition_book: list) -> torch.Tensor:
+    ranges = []
+    for p in partition_book:
+        ranges.append([int(p['start_idx']), int(p['end_idx'])])
+    if not ranges:
+        return torch.empty((0, 2), dtype=torch.int32)
+    return torch.tensor(ranges, dtype=torch.int32)
+
+
+def _build_window_part_ids(part_ranges: torch.Tensor, num_nodes: int, tile_rows: int) -> torch.Tensor:
+    num_windows = (int(num_nodes) + tile_rows - 1) // tile_rows
+    win_part_ids = torch.full((num_windows,), -1, dtype=torch.int32)
+    if part_ranges.numel() == 0:
+        return win_part_ids
+    for pid, (start, end) in enumerate(part_ranges.tolist()):
+        start_win = int(start) // tile_rows
+        end_win = int(end) // tile_rows
+        win_part_ids[start_win:end_win] = pid
+    return win_part_ids
+
+
+def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx, test_idx, device,
+                             static_scores: torch.Tensor = None,
+                             window_part_ids: torch.Tensor = None,
+                             part_ranges: torch.Tensor = None,
+                             hacs_params: Dict[str, Any] = None):
     """
     [DPS Index-Based Preprocess] 
     仅运行采样算法生成 Partition Book (Window IDs)，不保存物理子图。
@@ -236,7 +289,38 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
     
     tile_rows = int(config.get('tile_rows', 16))
     tile_cols = int(config.get('tile_cols', 8))
-    
+
+    if hacs_params is None:
+        hacs_params = _parse_hacs_config(config)
+    hacs_enabled = bool(hacs_params.get('enabled', True))
+    alpha = float(hacs_params.get('alpha', 1.0))
+    beta = float(hacs_params.get('beta', 10.0))
+    delta = float(hacs_params.get('delta', 0.0))
+    gamma_bonus = float(hacs_params.get('gamma_bonus', 0.0))
+    score_scale = float(hacs_params.get('score_scale', 100.0))
+    q_min = float(hacs_params.get('q_min', 0.5))
+    q_max = float(hacs_params.get('q_max', 2.0))
+    q_eps = float(hacs_params.get('q_eps', 1e-6))
+
+    if hacs_enabled:
+        if static_scores is None:
+            degs = g_raw.in_degrees()
+            if degs.device != features.device:
+                degs = degs.to(features.device)
+            static_scores = _compute_hacs_static_scores(features, degs, q_min, q_max, q_eps)
+        if part_ranges is not None and window_part_ids is None:
+            if not isinstance(part_ranges, torch.Tensor):
+                part_ranges = torch.tensor(part_ranges, dtype=torch.int32)
+            window_part_ids = _build_window_part_ids(part_ranges, g_raw.num_nodes(), tile_rows)
+    else:
+        static_scores = None
+        window_part_ids = None
+        part_ranges = None
+
+    locality_enabled = bool(hacs_params.get('locality_enabled', True))
+    if not (window_part_ids is not None and part_ranges is not None):
+        locality_enabled = False
+
     # 将原图转换为 BCSR (这就是训练要用的图，常驻显存)
     # 注意：为了预处理采样速度，我们先把图放到 device 上
     bcsr_full = BCSRGraph.from_dgl(g_raw.to(device), tile_rows, tile_cols)
@@ -248,7 +332,17 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
         tile_cols=tile_cols,
         warps_per_block=int(config.get('warps_per_block', 8)),
         partition_book=None,
-        verbose=False
+        verbose=False,
+        static_scores=static_scores,
+        window_part_ids=window_part_ids,
+        part_ranges=part_ranges,
+        hacs_enabled=hacs_enabled,
+        alpha=alpha,
+        beta=beta,
+        delta=delta,
+        gamma_bonus=gamma_bonus,
+        score_scale=score_scale,
+        locality_enabled=locality_enabled
     )
     
     # 3. 准备种子 Windows
@@ -336,7 +430,8 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
     # train_idx 等保持为全局索引
     # super_map 不再需要，返回 None
     
-    return bcsr_full, features, labels, train_idx, val_idx, test_idx, partition_book, None
+    return (bcsr_full, features, labels, train_idx, val_idx, test_idx,
+            partition_book, None, static_scores, window_part_ids, part_ranges, hacs_enabled)
 
 
 def apply_rcm_reorder(g, features, labels, train_idx, val_idx, test_idx):
@@ -856,6 +951,12 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
         pass
     else:
         raise ValueError(f"Unknown preprocess_mode: {preprocess_mode}. Use 'rcm', 'metis', 'metis+rcm', or 'none'.")
+
+    hacs_params = None
+    hacs_enabled = False
+    if train_mode == 'DPS':
+        hacs_params = _parse_hacs_config(config)
+        hacs_enabled = bool(hacs_params.get('enabled', True))
     
     adapter = build_adapter(ds_cfg)
     use_uva = config.get('use_uva', False)
@@ -889,6 +990,8 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
         step_size = int(dps_cfg.get('probe_step_size', 50))
         strategy = dps_cfg.get('strategy', 'seed_increment')
         storage_format = f"_{train_mode}_edge{max_edges}_step{step_size}_{strategy}"
+        if hacs_enabled:
+            storage_format = f"{storage_format}_hacs"
     elif train_mode == 'BAPS':
         storage_format = f"_{train_mode}_p{num_partitions}"
     elif train_mode == 'node':
@@ -962,6 +1065,14 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
             mode_str = "METIS + Intra-RCM" if use_intra_rcm else "METIS (No RCM)"
             print(f"  [Data] {mode_str} preprocessing done. Graph reordered.")
 
+        static_scores = None
+        window_part_ids = None
+        part_ranges = None
+
+        if train_mode == 'DPS' and hacs_enabled and use_metis:
+            part_ranges = _build_part_ranges(metis_book)
+            window_part_ids = _build_window_part_ids(part_ranges, g_curr.num_nodes(), tile_rows)
+
         # [Step 3] 处理 DPS 模式特有的逻辑
         # DPS 需要在当前图（可能是 Raw, RCM, 或 METIS 后的图）基础上生成 Window Partition Book
         if train_mode == 'DPS':
@@ -970,9 +1081,15 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
             # 但为了保持接口兼容，这里我们传入 g_curr。
             # 如果 Step 2 跑了 METIS，g_curr 已经是重排后的图；如果没跑，就是 adapter 返回的图。
             
-            bcsr_final, f_final, l_final, tr_final, va_final, te_final, dps_book, super_map = process_dps_static_graph(
-                config, g_curr, bundle.features, bundle.labels, 
-                bundle.train_idx, bundle.val_idx, bundle.test_idx, device
+            (bcsr_final, f_final, l_final, tr_final, va_final, te_final,
+             dps_book, super_map, static_scores, window_part_ids, part_ranges,
+             hacs_enabled) = process_dps_static_graph(
+                config, g_curr, bundle.features, bundle.labels,
+                bundle.train_idx, bundle.val_idx, bundle.test_idx, device,
+                static_scores=static_scores,
+                window_part_ids=window_part_ids,
+                part_ranges=part_ranges,
+                hacs_params=hacs_params
             )
             
             partition_book = dps_book
@@ -980,7 +1097,11 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
                 bcsr_final, f_final, l_final, 
                 tr_final, va_final, te_final,
                 bundle.num_classes, partition_book=partition_book,
-                super_map=super_map
+                super_map=super_map,
+                static_scores=static_scores,
+                window_part_ids=window_part_ids,
+                part_ranges=part_ranges,
+                hacs_enabled=hacs_enabled
             )
 
         # [Step 4] BAPS 模式检查
@@ -1034,6 +1155,11 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
             labels = F.pad(labels, (0, 0, 0, pad_len), "constant", 0)
         else:
             labels = F.pad(labels, (0, pad_len), "constant", 0)
+    static_scores = getattr(bundle, 'static_scores', None)
+    if static_scores is not None and static_scores.shape[0] < expected_rows:
+        pad_len = expected_rows - static_scores.shape[0]
+        static_scores = F.pad(static_scores, (0, pad_len), "constant", 0)
+        bundle = bundle._replace(static_scores=static_scores)
 
     # UVA 优化逻辑
     # 策略: DPS 模式下生成的特征极大，默认保留在 CPU
@@ -1089,6 +1215,9 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
         bundle.test_idx, 
         bundle.num_classes, 
         bundle.partition_book,
-        getattr(bundle, 'super_map', None)
+        getattr(bundle, 'super_map', None),
+        getattr(bundle, 'static_scores', None),
+        getattr(bundle, 'window_part_ids', None),
+        getattr(bundle, 'part_ranges', None),
+        getattr(bundle, 'hacs_enabled', False)
     )
-

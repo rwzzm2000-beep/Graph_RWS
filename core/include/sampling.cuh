@@ -47,6 +47,17 @@ namespace cg = cooperative_groups;
  * @param d_active_windows GNN的MINI-BATCH中target node所处window的索引。
  * @param d_window_masks GNN的MINI-BATCH中target node所处window内的mask。
  * @param num_active_windows d_active_windows数组的大小。
+ * @param d_static_scores 全局静态分数 (Q_v)。
+ * @param d_window_part_ids window->partition 映射。
+ * @param d_part_starts 分区起始节点 ID。
+ * @param d_part_ends 分区结束节点 ID。
+ * @param alpha HACS 结构项系数。
+ * @param beta HACS 边权重系数。
+ * @param delta HACS locality 奖励。
+ * @param gamma_bonus HACS 发现奖励 (近似 γ)。
+ * @param score_scale HACS 量化缩放因子。
+ * @param use_hacs 是否启用 HACS。
+ * @param locality_enabled 是否启用 locality。
  * @param d_sampled_col_indices_out 指向中间结果缓冲区的指针，用于存放所有窗口的采样结果。
  * @param d_new_tile_per_window_out 指向中间结果缓冲区的指针，用于存放所有窗口的新tile数量。
  * @param actual_sample_num 实际采样列数量。
@@ -59,6 +70,17 @@ __global__ void warp_centric_find_top_k_kernel(
     const int* __restrict__ d_active_windows,
     const int* __restrict__ d_window_masks,
     const long long num_active_windows,
+    const float* __restrict__ d_static_scores,
+    const int* __restrict__ d_window_part_ids,
+    const int* __restrict__ d_part_starts,
+    const int* __restrict__ d_part_ends,
+    float alpha,
+    float beta,
+    float delta,
+    float gamma_bonus,
+    float score_scale,
+    int use_hacs,
+    int locality_enabled,
     int* __restrict__ d_sampled_col_indices_out,
     int* __restrict__ d_new_tile_per_window_out,
     int actual_sample_num)
@@ -91,6 +113,12 @@ __global__ void warp_centric_find_top_k_kernel(
     }
 
     // ==================== 参数校验与初始化 ====================
+    const int use_hacs_flag = (use_hacs != 0);
+    const int locality_flag = (locality_enabled != 0);
+    const int gamma_bonus_int = (use_hacs_flag && gamma_bonus > 0.0f)
+        ? (int)(gamma_bonus * score_scale)
+        : 0;
+
     // 编译期常量计算（确保tile尺寸匹配）
     constexpr int ELEMENTS_PER_TILE = TILE_ROWS * TILE_COLS;    // 16*8
     constexpr int ELEMENTS_PER_THREAD = ELEMENTS_PER_TILE / 32; // 4
@@ -219,14 +247,34 @@ __global__ void warp_centric_find_top_k_kernel(
                         //     continue;
                         // }
 
-                        // 计算混合评分 (Hybrid Score)
-                        // 1.0f: 基础拓扑分 (Topology)，保证结构性
-                        // 10.0f: 调节因子 (alpha)，控制权重的相关性强度
-                        // my_vals[e]: 当前边的权重 (Intensity)
-                        // 1000.0f: 将浮点分值放大为整数以便 atomicAdd 累加
-                        // fabsf: 取绝对值防止负权重影响（视具体情况可省略）
-                        float raw_score = 1.0f + 10.0f * fabsf(my_vals[e]);
-                        int score_int = (int)(raw_score * 1000.0f);
+                        int score_int = 0;
+                        if (use_hacs_flag) {
+                            float q_v = 1.0f;
+                            if (d_static_scores != nullptr) {
+                                q_v = __ldg(&d_static_scores[col_to_check]);
+                            }
+
+                            float edge_val = fabsf(my_vals[e]);
+                            float score_f = (alpha + beta * edge_val) * q_v;
+
+                            if (locality_flag && d_window_part_ids != nullptr && d_part_starts != nullptr && d_part_ends != nullptr) {
+                                int part_id = d_window_part_ids[window_id];
+                                if (part_id >= 0) {
+                                    int start = d_part_starts[part_id];
+                                    int end = d_part_ends[part_id];
+                                    if (col_to_check >= start && col_to_check < end) {
+                                        score_f += delta;
+                                    }
+                                }
+                            }
+
+                            score_int = (int)(score_f * score_scale);
+                        } else {
+                            float raw_score = 1.0f + 10.0f * fabsf(my_vals[e]);
+                            score_int = (int)(raw_score * 1000.0f);
+                        }
+
+                        if (score_int <= 0) continue;
 
                         bool found = false;
                         for (int i = 0; i < shared.alias.phase1.warp_candidate_cnt[warp_id]; ++i) {
@@ -280,7 +328,11 @@ __global__ void warp_centric_find_top_k_kernel(
                     // 如果是新列，并且还有空间，则添加
                     if (!found && shared.global_candidate_cnt < GLOBAL_BUFFER_SIZE) {
                         shared.global_cols[shared.global_candidate_cnt] = col_to_add;
-                        shared.global_counts[shared.global_candidate_cnt] = freq_to_add;
+                        int freq = freq_to_add;
+                        if (gamma_bonus_int != 0) {
+                            freq += gamma_bonus_int;
+                        }
+                        shared.global_counts[shared.global_candidate_cnt] = freq;
                         shared.global_candidate_cnt++;
                     }
                 }

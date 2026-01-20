@@ -44,7 +44,17 @@ class BCSRSampler:
                  tile_cols: int = 8,
                  warps_per_block: int = 8,
                  partition_book: list = None,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 static_scores: torch.Tensor = None,
+                 window_part_ids: torch.Tensor = None,
+                 part_ranges: torch.Tensor = None,
+                 hacs_enabled: bool = False,
+                 alpha: float = 1.0,
+                 beta: float = 10.0,
+                 delta: float = 0.0,
+                 gamma_bonus: float = 0.0,
+                 score_scale: float = 100.0,
+                 locality_enabled: bool = False):
         self.fanouts = fanouts
         self.tile_rows = tile_rows
         self.tile_cols = tile_cols
@@ -52,17 +62,94 @@ class BCSRSampler:
         self.partition_book = partition_book
         self.verbose = verbose
         self.time_tracker = {}
+        self.static_scores = static_scores
+        self.window_part_ids = window_part_ids
+        self.part_ranges = part_ranges
+        self.hacs_enabled = bool(hacs_enabled)
+        self.locality_enabled = bool(locality_enabled)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.delta = float(delta)
+        self.gamma_bonus = float(gamma_bonus)
+        self.score_scale = float(score_scale)
+        self._dummy_hacs = {}
 
     # ---------- 内部工具 ----------
     @staticmethod
-    def _to_cuda_int(x: torch.Tensor) -> torch.Tensor:
+    def _to_cuda_int(x: torch.Tensor, device: torch.device = None) -> torch.Tensor:
         if not isinstance(x, torch.Tensor):
             x = torch.tensor(x)
-        if x.device.type != 'cuda':
-            x = x.to('cuda', non_blocking=True)
+        if device is None:
+            device = torch.device('cuda')
+        if x.device != device:
+            x = x.to(device, non_blocking=True)
         if x.dtype != torch.int32:
             x = x.to(torch.int32)
-        return x
+        return x.contiguous()
+
+    @staticmethod
+    def _to_cuda_float(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x)
+        if x.device != device:
+            x = x.to(device, non_blocking=True)
+        if x.dtype != torch.float32:
+            x = x.to(torch.float32)
+        return x.contiguous()
+
+    def _get_dummy_hacs(self, device: torch.device):
+        if device not in self._dummy_hacs:
+            self._dummy_hacs[device] = {
+                'static_scores': torch.ones(1, device=device, dtype=torch.float32),
+                'window_part_ids': torch.zeros(1, device=device, dtype=torch.int32),
+                'part_starts': torch.zeros(1, device=device, dtype=torch.int32),
+                'part_ends': torch.zeros(1, device=device, dtype=torch.int32)
+            }
+        return self._dummy_hacs[device]
+
+    def _prepare_hacs_tensors(self, device: torch.device):
+        use_hacs = self.hacs_enabled and self.static_scores is not None
+        if not use_hacs:
+            dummy = self._get_dummy_hacs(device)
+            return (dummy['static_scores'], dummy['window_part_ids'],
+                    dummy['part_starts'], dummy['part_ends'], 0, 0)
+
+        if not isinstance(self.static_scores, torch.Tensor):
+            self.static_scores = torch.tensor(self.static_scores)
+        if self.static_scores.dtype != torch.float32:
+            self.static_scores = self.static_scores.to(torch.float32)
+        if self.static_scores.device != device:
+            self.static_scores = self.static_scores.to(device, non_blocking=True)
+        static_scores = self.static_scores.contiguous()
+        locality_enabled = int(self.locality_enabled and
+                               (self.window_part_ids is not None) and
+                               (self.part_ranges is not None))
+
+        if locality_enabled:
+            if not isinstance(self.window_part_ids, torch.Tensor):
+                self.window_part_ids = torch.tensor(self.window_part_ids)
+            if self.window_part_ids.dtype != torch.int32:
+                self.window_part_ids = self.window_part_ids.to(torch.int32)
+            if self.window_part_ids.device != device:
+                self.window_part_ids = self.window_part_ids.to(device, non_blocking=True)
+            window_part_ids = self.window_part_ids.contiguous()
+
+            if not isinstance(self.part_ranges, torch.Tensor):
+                self.part_ranges = torch.tensor(self.part_ranges, dtype=torch.int32)
+            if self.part_ranges.dtype != torch.int32:
+                self.part_ranges = self.part_ranges.to(torch.int32)
+            if self.part_ranges.device != device:
+                self.part_ranges = self.part_ranges.to(device, non_blocking=True)
+            part_ranges = self.part_ranges.contiguous()
+            part_starts = part_ranges[:, 0].contiguous()
+            part_ends = part_ranges[:, 1].contiguous()
+        else:
+            dummy = self._get_dummy_hacs(device)
+            window_part_ids = dummy['window_part_ids']
+            part_starts = dummy['part_starts']
+            part_ends = dummy['part_ends']
+
+        return static_scores, window_part_ids, part_starts, part_ends, 1, locality_enabled
 
     def _build_subgraph(self,
                         out_win_off: torch.Tensor,
@@ -114,12 +201,16 @@ class BCSRSampler:
         # 模型层顺序是 [L0, L1, L2] (输入->输出)
         # 采样顺序是 [L2, L1, L0] (输出->输入，从 Seed 节点向外扩)
         reversed_fanouts = list(reversed(self.fanouts))
-        seed_nodes = self._to_cuda_int(seed_nodes)
+        device = g.window_offset.device if g.window_offset.is_cuda else torch.device('cuda')
+        seed_nodes = self._to_cuda_int(seed_nodes, device=device)
         
         # [Fix 1] 核心修复：将 window_offset 转换为 int32
         # BCSRGraph 默认存储 int64，但 C++ Kernel 期望 int32 指针
         # 如果不转，Kernel 会读取错误的 stride，导致偏移量错乱，引发 Illegal Memory Access。
         win_offset_i32 = g.window_offset.to(torch.int32)
+
+        static_scores, window_part_ids, part_starts, part_ends, use_hacs, locality_enabled = \
+            self._prepare_hacs_tensors(seed_nodes.device)
         
         # 2. 调用 C++ 接口
         all_layers_data, timing_list = sample_all_layers(
@@ -129,6 +220,17 @@ class BCSRSampler:
             seed_nodes,
             reversed_fanouts,
             int(g.num_nodes),
+            static_scores,
+            window_part_ids,
+            part_starts,
+            part_ends,
+            float(self.alpha),
+            float(self.beta),
+            float(self.delta),
+            float(self.gamma_bonus),
+            float(self.score_scale),
+            int(use_hacs),
+            int(locality_enabled),
             self.tile_rows,
             self.tile_cols,
             self.warps_per_block
@@ -581,7 +683,17 @@ class BCSRSampler:
             tile_rows=self.tile_rows, 
             tile_cols=self.tile_cols,
             warps_per_block=self.warps_per_block,
-            verbose=False 
+            verbose=False,
+            static_scores=self.static_scores,
+            window_part_ids=self.window_part_ids,
+            part_ranges=self.part_ranges,
+            hacs_enabled=self.hacs_enabled,
+            alpha=self.alpha,
+            beta=self.beta,
+            delta=self.delta,
+            gamma_bonus=self.gamma_bonus,
+            score_scale=self.score_scale,
+            locality_enabled=self.locality_enabled
         )
         
         # 执行采样
@@ -609,5 +721,3 @@ class BCSRSampler:
         subgraph = self.repack_subgraph(g, unique_windows)
         
         return subgraph
-
-

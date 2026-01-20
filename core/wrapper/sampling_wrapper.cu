@@ -61,6 +61,17 @@ static std::pair<std::vector<torch::Tensor>, SamplingTimingResult> sample_one_la
     const torch::Tensor& values_condensed,
     const torch::Tensor& active_windows,
     const torch::Tensor& window_masks,
+    const torch::Tensor& static_scores,
+    const torch::Tensor& window_part_ids,
+    const torch::Tensor& part_starts,
+    const torch::Tensor& part_ends,
+    float alpha,
+    float beta,
+    float delta,
+    float gamma_bonus,
+    float score_scale,
+    int use_hacs,
+    int locality_enabled,
     int fanout,
     int tile_rows,
     int tile_cols,
@@ -80,6 +91,15 @@ static std::pair<std::vector<torch::Tensor>, SamplingTimingResult> sample_one_la
     auto sampled_cols = torch::full({num_active_windows * sample_num}, -1, opts);
     auto tile_counts_per_window = torch::zeros({num_active_windows}, opts);
 
+    if (use_hacs) {
+        CHECK_INPUT(static_scores);
+    }
+    if (locality_enabled) {
+        CHECK_INPUT(window_part_ids);
+        CHECK_INPUT(part_starts);
+        CHECK_INPUT(part_ends);
+    }
+
     // === Phase 1: Warp-Centric Sampling ===
     {
         CUDATimer p1_timer;
@@ -96,6 +116,10 @@ static std::pair<std::vector<torch::Tensor>, SamplingTimingResult> sample_one_la
         const int* d_mask = GET_CONST_PTR(int, window_masks);
         int* d_out_cols = GET_PTR(int, sampled_cols);
         int* d_out_tiles = GET_PTR(int, tile_counts_per_window);
+        const float* d_static = GET_CONST_PTR(float, static_scores);
+        const int* d_win_part = GET_CONST_PTR(int, window_part_ids);
+        const int* d_part_starts = GET_CONST_PTR(int, part_starts);
+        const int* d_part_ends = GET_CONST_PTR(int, part_ends);
 
         if (tile_rows == 16 && tile_cols == 8) {
             // 使用 macros.h 中的 DISPATCH 宏
@@ -105,6 +129,9 @@ static std::pair<std::vector<torch::Tensor>, SamplingTimingResult> sample_one_la
                     4, sample_num, stream,
                     d_win, d_col, d_val,
                     d_act, d_mask, num_active_windows,
+                    d_static, d_win_part, d_part_starts, d_part_ends,
+                    alpha, beta, delta, gamma_bonus, score_scale,
+                    use_hacs, locality_enabled,
                     d_out_cols, d_out_tiles
                 );
             } else if (warps_per_block == 8) {
@@ -112,6 +139,9 @@ static std::pair<std::vector<torch::Tensor>, SamplingTimingResult> sample_one_la
                     8, sample_num, stream,
                     d_win, d_col, d_val,
                     d_act, d_mask, num_active_windows,
+                    d_static, d_win_part, d_part_starts, d_part_ends,
+                    alpha, beta, delta, gamma_bonus, score_scale,
+                    use_hacs, locality_enabled,
                     d_out_cols, d_out_tiles
                 );
             } else {
@@ -339,6 +369,17 @@ std::pair<std::vector<std::vector<torch::Tensor>>, std::vector<SamplingTimingRes
     const torch::Tensor& initial_seeds,
     std::vector<int> fanouts,
     long long num_global_nodes,
+    const torch::Tensor& static_scores,
+    const torch::Tensor& window_part_ids,
+    const torch::Tensor& part_starts,
+    const torch::Tensor& part_ends,
+    float alpha,
+    float beta,
+    float delta,
+    float gamma_bonus,
+    float score_scale,
+    int use_hacs,
+    int locality_enabled,
     int tile_rows,
     int tile_cols,
     int warps_per_block)
@@ -360,6 +401,8 @@ std::pair<std::vector<std::vector<torch::Tensor>>, std::vector<SamplingTimingRes
         auto res = sample_one_layer_internal(
             window_offset, original_col_indices, values_condensed,
             curr_active_windows, curr_masks,
+            static_scores, window_part_ids, part_starts, part_ends,
+            alpha, beta, delta, gamma_bonus, score_scale, use_hacs, locality_enabled,
             fanout,
             tile_rows, tile_cols, warps_per_block, stream
         );
@@ -385,4 +428,3 @@ std::pair<std::vector<std::vector<torch::Tensor>>, std::vector<SamplingTimingRes
     
     return {all_layers_data, all_layer_timings};
 }
-
