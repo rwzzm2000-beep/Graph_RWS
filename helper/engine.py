@@ -540,6 +540,110 @@ def train_epoch_dps_static(model,
 
 
 @torch.no_grad()
+def evaluate_dps_sampling(model: 'GCN_BCSR',
+                          bcsr_full,
+                          features: torch.Tensor,
+                          labels: torch.Tensor,
+                          eval_bool_mask: torch.Tensor,
+                          device,
+                          partition_loader,
+                          sampler,
+                          partition_book):
+    """
+    [DPS Evaluation] 复用 DPS 切图管线做评估，避免全图推理 OOM。
+    """
+    model.eval()
+
+    total_correct_tensor = torch.zeros(1, device=device)
+    total_samples = 0
+
+    import queue
+    import threading
+
+    sample_stream = torch.cuda.Stream()
+    data_queue = queue.Queue(maxsize=2)
+    stop_event = threading.Event()
+
+    def producer():
+        with torch.cuda.stream(sample_stream):
+            for batch_pids in partition_loader:
+                if stop_event.is_set():
+                    break
+                try:
+                    pids_list = batch_pids.tolist()
+                    batch_windows_list = [partition_book[pid] for pid in pids_list]
+                    batch_window_ids = torch.cat(batch_windows_list).to(device, non_blocking=True)
+
+                    subgraph = sampler.repack_subgraph(bcsr_full, batch_window_ids)
+
+                    global_nids = subgraph.original_node_ids
+                    batch_inputs = features[global_nids.cpu()].to(device, non_blocking=True)
+
+                    if labels.is_cuda:
+                        batch_labels = labels[global_nids]
+                    else:
+                        batch_labels = labels[global_nids.cpu()].to(device, non_blocking=True)
+
+                    if eval_bool_mask.is_cuda:
+                        batch_mask = eval_bool_mask[global_nids]
+                    else:
+                        batch_mask = eval_bool_mask[global_nids.cpu()].to(device, non_blocking=True)
+
+                    data_queue.put((subgraph, batch_inputs, batch_labels, batch_mask))
+                except Exception as e:
+                    print(f"Producer Error in DPS Eval: {e}")
+                    stop_event.set()
+                    break
+        data_queue.put(None)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+
+    try:
+        while True:
+            item = data_queue.get()
+            if item is None:
+                break
+            subgraph, batch_inputs, batch_labels, batch_mask = item
+            torch.cuda.current_stream().wait_stream(sample_stream)
+
+            if not batch_mask.any():
+                del subgraph, batch_inputs, batch_labels, batch_mask
+                continue
+
+            if hasattr(subgraph, 'inner_graph'):
+                graphs_list = [subgraph] + [subgraph.inner_graph] * (model.num_layers - 1)
+            else:
+                graphs_list = [subgraph] * model.num_layers
+
+            logits = model(graphs_list, batch_inputs)
+            n_internal = logits.size(0)
+            target_mask = batch_mask[:n_internal]
+            target_labels = batch_labels[:n_internal]
+
+            if not target_mask.any():
+                del subgraph, batch_inputs, batch_labels, batch_mask, logits
+                continue
+
+            eval_logits = logits[target_mask]
+            eval_labels = target_labels[target_mask]
+            _, correct_count, batch_num_samples = compute_loss_and_metrics(eval_logits, eval_labels)
+
+            total_correct_tensor += correct_count
+            total_samples += batch_num_samples
+
+            del subgraph, batch_inputs, batch_labels, batch_mask, logits
+    finally:
+        thread.join()
+
+    if total_samples > 0:
+        acc = (total_correct_tensor / total_samples).item()
+    else:
+        acc = 0.0
+    return acc
+
+
+@torch.no_grad()
 def evaluate(model: 'GCN_BCSR',
              bcsr_full,
              features: torch.Tensor,
@@ -561,6 +665,5 @@ def evaluate(model: 'GCN_BCSR',
         acc = 0.0
         
     return acc
-
 
 

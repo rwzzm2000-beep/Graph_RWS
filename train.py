@@ -19,6 +19,7 @@ from .helper.engine import (
     train_epoch_node_sampling,
     train_epoch_dps_static,
     train_epoch_baps,
+    evaluate_dps_sampling,
     evaluate, 
     PartitionDataLoader,
 )
@@ -232,6 +233,8 @@ def main():
     dps_loader = None
     baps_loader = None
     train_bool_mask = None
+    val_bool_mask = None
+    test_bool_mask = None
 
     # 只有 DPS 和 BAPS 需要 train_bool_mask 来过滤子图
     if train_mode in ['DPS', 'BAPS']:
@@ -252,9 +255,13 @@ def main():
                 # 临时兜底：把 train_idx 当作 global id（不一定正确，但至少不会崩）
                 print("[Warning] bundle.super_map is None in DPS; fallback to using train_idx as global id (may be WRONG).")
                 global_train_idx = bundle.train_idx.to(device)
+                global_val_idx = bundle.val_idx.to(device)
+                global_test_idx = bundle.test_idx.to(device)
             else:
                 super_map_dev = bundle.super_map.to(device)
                 global_train_idx = super_map_dev[bundle.train_idx.to(device)]
+                global_val_idx = super_map_dev[bundle.val_idx.to(device)]
+                global_test_idx = super_map_dev[bundle.test_idx.to(device)]
                 del super_map_dev
         else:
             # BAPS：一般 train_idx 就是 global id
@@ -262,6 +269,11 @@ def main():
 
         # 真正置 mask
         train_bool_mask[global_train_idx] = True
+        if train_mode == "DPS":
+            val_bool_mask = torch.zeros(num_orig_nodes, dtype=torch.bool, device=device)
+            test_bool_mask = torch.zeros(num_orig_nodes, dtype=torch.bool, device=device)
+            val_bool_mask[global_val_idx] = True
+            test_bool_mask[global_test_idx] = True
 
         # ===== Probe（一定要放在置 mask 之后）=====
         true_cnt = int(train_bool_mask.sum().item())
@@ -392,7 +404,20 @@ def main():
         # Evaluation
         val_acc = None
         if epoch % int(config.get('eval_interval', 5)) == 0:
-            val_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.val_idx, device)
+            if train_mode == 'DPS':
+                val_acc = evaluate_dps_sampling(
+                    model,
+                    bundle.bcsr_full,
+                    bundle.features,
+                    bundle.labels,
+                    val_bool_mask,
+                    device,
+                    partition_loader=dps_loader,
+                    sampler=sampler,
+                    partition_book=partition_book
+                )
+            else:
+                val_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.val_idx, device)
             
             # Update Scheduler
             if scheduler:
@@ -432,7 +457,20 @@ def main():
     elif enable_save_model:
         print("Warning: Best model checkpoint not found (maybe first epoch was best?).")
 
-    test_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.test_idx, device)
+    if train_mode == 'DPS':
+        test_acc = evaluate_dps_sampling(
+            model,
+            bundle.bcsr_full,
+            bundle.features,
+            bundle.labels,
+            test_bool_mask,
+            device,
+            partition_loader=dps_loader,
+            sampler=sampler,
+            partition_book=partition_book
+        )
+    else:
+        test_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.test_idx, device)
     print(f"\nFinal Test Accuracy: {test_acc*100:.2f} %")
 
     # 调用采样器的平均时间统计

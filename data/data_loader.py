@@ -268,6 +268,17 @@ def _build_window_part_ids(part_ranges: torch.Tensor, num_nodes: int, tile_rows:
     return win_part_ids
 
 
+def _get_mem_available_bytes() -> int:
+    try:
+        with open('/proc/meminfo', 'r') as handle:
+            for line in handle:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        return -1
+    return -1
+
+
 def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx, test_idx, device,
                              static_scores: torch.Tensor = None,
                              window_part_ids: torch.Tensor = None,
@@ -1085,19 +1096,73 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
         
     cache_path = os.path.join(root_dir, cache_filename)
     partition_book_path = cache_path.replace('.pt', '_partition_book.pt')
+    lite_cache_path = cache_path.replace('.pt', '_lite.pt')
+    bin_feat_path = cache_path.replace('.pt', '_feat.bin')
+    features_from_mmap = False
 
     # 3. 加载或处理逻辑
     partition_book = None
     
     if os.path.exists(cache_path):
         print(f"[Data] Loading cached dataset from: {cache_path}")
-        bundle = torch.load(cache_path, weights_only=False)
-        
+
+        lite_loaded = False
+        if os.path.exists(lite_cache_path):
+            try:
+                bundle = torch.load(lite_cache_path, weights_only=False)
+                lite_loaded = True
+                print(f"[Data] Loaded lite cache: {lite_cache_path}")
+            except Exception as e:
+                print(f"[Data] Failed to load lite cache: {e}")
+                lite_loaded = False
+
+        if lite_loaded and (not os.path.exists(bin_feat_path)) and bundle.features.numel() == 0:
+            print("[Data] Lite cache found but binary features missing; falling back to full cache.")
+            lite_loaded = False
+
+        if not lite_loaded:
+            bundle = torch.load(cache_path, weights_only=False)
+
         # 尝试加载 partition_book (如果是 DPS 或 BAPS/METIS 生成的)
         if os.path.exists(partition_book_path):
             partition_book = torch.load(partition_book_path, weights_only=False)
             bundle = bundle._replace(partition_book=partition_book)
-            
+
+        # 尝试从二进制文件快速加载特征
+        if os.path.exists(bin_feat_path):
+            num_rows = int(bundle.labels.shape[0])
+            file_size = os.path.getsize(bin_feat_path)
+            if num_rows > 0 and (file_size % (num_rows * 4) == 0):
+                feat_dim = file_size // (num_rows * 4)
+                mem_avail = _get_mem_available_bytes()
+                if mem_avail > 0 and file_size * 2 > mem_avail:
+                    np_feat = np.memmap(bin_feat_path, dtype=np.float32, mode='r', shape=(num_rows, feat_dim))
+                    features_from_mmap = True
+                    print(f"[Data] Features loaded via memmap: {bin_feat_path}")
+                else:
+                    np_feat = np.fromfile(bin_feat_path, dtype=np.float32)
+                    np_feat = np_feat.reshape(num_rows, feat_dim)
+                    print(f"[Data] Features loaded from binary: {bin_feat_path}")
+
+                features = torch.from_numpy(np_feat)
+                if not features_from_mmap and mem_avail > 0 and file_size < int(mem_avail * 0.7):
+                    features = features.pin_memory()
+                bundle = bundle._replace(features=features)
+            else:
+                print(f"[Data] Binary feature shape mismatch, ignoring: {bin_feat_path}")
+
+        # 若已存在完整缓存但没有二进制特征，创建二进制加速文件供下次使用
+        if not os.path.exists(bin_feat_path):
+            feat_bytes = int(bundle.features.numel()) * bundle.features.element_size()
+            if feat_bytes > (5 * 1024 ** 3):
+                try:
+                    print(f"[Data] Saving features to binary for faster startup: {bin_feat_path}")
+                    bundle.features.cpu().numpy().tofile(bin_feat_path)
+                    lite_bundle = bundle._replace(features=torch.empty((0, 0), dtype=bundle.features.dtype))
+                    torch.save(lite_bundle, lite_cache_path)
+                    print(f"[Data] Lite cache saved: {lite_cache_path}")
+                except Exception as e:
+                    print(f"[Data] Failed to save binary features: {e}")
     else:
         print(f"[Data] Cache not found. Processing dataset (Mode={train_mode}, Preprocess={preprocess_mode})...")
         
@@ -1194,6 +1259,16 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
             pass
 
         # 保存缓存
+        feat_bytes = int(bundle.features.numel()) * bundle.features.element_size()
+        if feat_bytes > (5 * 1024 ** 3):
+            try:
+                print(f"[Data] Saving features to binary for faster startup: {bin_feat_path}")
+                bundle.features.cpu().numpy().tofile(bin_feat_path)
+                lite_bundle = bundle._replace(features=torch.empty((0, 0), dtype=bundle.features.dtype))
+                torch.save(lite_bundle, lite_cache_path)
+                print(f"[Data] Lite cache saved: {lite_cache_path}")
+            except Exception as e:
+                print(f"[Data] Failed to save binary features: {e}")
         torch.save(bundle, cache_path)
         if partition_book is not None:
             torch.save(partition_book, partition_book_path)
@@ -1250,7 +1325,10 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
     if use_uva:
         # 特征必须在 CPU 且 Pin 住，以便 GPU 通过 PCIe 快速读取
         if not features.is_cuda:
-            features = features.share_memory_().pin_memory()
+            if features_from_mmap:
+                print("[Data] Skip pin_memory for memmap features.")
+            else:
+                features = features.share_memory_().pin_memory()
         
         # [Fix] Pin BCSR structures ONLY if they are on CPU
         # 如果是 DPS 模式，bcsr 可能已经在 GPU 上了，此时不能 pin
