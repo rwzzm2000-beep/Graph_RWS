@@ -125,6 +125,7 @@ Graph_RWS/
     CUDA_VISIBLE_DEVICES=2 python -m Graph_RWS.train --config Graph_RWS/configs/cora.yaml
     CUDA_VISIBLE_DEVICES=2 python -m Graph_RWS.train --config Graph_RWS/configs/ogbn_arxiv.yaml
     CUDA_VISIBLE_DEVICES=1 python -m Graph_RWS.train --config Graph_RWS/configs/reddit.yaml
+    CUDA_VISIBLE_DEVICES=1 python -m Graph_RWS.train --config Graph_RWS/configs/ogbn_papers100M.yaml
 
 [Step 3] 自定义配置运行
     python -m Graph_RWS.train --config ./my_config.yaml --save-model

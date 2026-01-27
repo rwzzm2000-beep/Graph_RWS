@@ -17,7 +17,7 @@ train_mode: DPS
 
 # ================= [3. 预处理策略配置] =================
 # 预处理模式: 'rcm' | 'metis' | 'metis+rcm' | 'none'
-preprocess_mode: metis+rcm
+preprocess_mode: none
 
 # METIS 专用参数
 # 1.1e8 节点 / 5000 ≈ 2.2万节点/分区

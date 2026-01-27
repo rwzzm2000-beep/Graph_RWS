@@ -11,6 +11,7 @@
 """
 
 from typing import List
+from types import SimpleNamespace
 import torch
 import numpy as np
 
@@ -416,7 +417,8 @@ class BCSRSampler:
         return subgraph
 
 
-    def repack_subgraph(self, g: BCSRGraph, window_ids: torch.Tensor, max_external_ratio: float = 5.0) -> BCSRGraph:
+    def repack_subgraph(self, g: BCSRGraph, window_ids: torch.Tensor, max_external_ratio: float = 5.0,
+                        dry_run: bool = False) -> BCSRGraph:
         """
         [方案 B 增强版] Halo-Aware Subgraph Repacking with OOM Guard.
         
@@ -429,14 +431,38 @@ class BCSRSampler:
         """
         device = window_ids.device
         window_ids, _ = torch.sort(window_ids)
+        if window_ids.numel() > 0:
+            valid_win_mask = (window_ids >= 0) & (window_ids < g.num_windows)
+            window_ids = window_ids[valid_win_mask]
         num_windows = window_ids.size(0)
         num_internal_nodes = num_windows * self.tile_rows
 
+        # 定义智能索引助手：自动处理设备不一致 (UVA Mode)
+        def _smart_index(source_tensor, index_tensor):
+            if source_tensor.device != index_tensor.device:
+                # 1. 将索引移到 source 所在的设备 (如 CPU)
+                # 2. 执行切片
+                # 3. 将结果移回当前计算设备 (如 GPU)
+                return source_tensor[index_tensor.to(source_tensor.device)].to(device)
+            return source_tensor[index_tensor]
+
         # 1. 准备数据访问指针
-        starts = g.window_offset[window_ids]
-        ends = g.window_offset[window_ids + 1]
+        starts = _smart_index(g.window_offset, window_ids)
+        ends = _smart_index(g.window_offset, window_ids + 1)
         lengths = ends - starts 
         
+        if dry_run:
+            total_tiles = int(lengths.sum().item()) if lengths.numel() > 0 else 0
+            stub = SimpleNamespace()
+            stub.original_window_ids = window_ids
+            stub.num_internal_nodes = num_internal_nodes
+            stub.total_tiles = total_tiles
+            stub.approx_values = total_tiles * self.tile_rows * self.tile_cols
+            stub.approx_cols = total_tiles * self.tile_cols
+            stub.values_condensed = None
+            stub.original_col_indices = None
+            return stub
+
         new_window_offset = torch.zeros(num_windows + 1, dtype=torch.int64, device=device)
         new_window_offset[1:] = torch.cumsum(lengths, dim=0)
         
@@ -452,13 +478,13 @@ class BCSRSampler:
         
         # 原始列索引 (Global Node IDs, 包含 -1)
         orig_cols_view = g.original_col_indices.view(-1, self.tile_cols)
-        raw_col_indices = orig_cols_view[gather_tile_indices].view(-1)
+        raw_col_indices = _smart_index(orig_cols_view, gather_tile_indices).view(-1)
         
         # 原始权重 (如果有)
         raw_values = None
         if g.values_condensed is not None:
             orig_vals_view = g.values_condensed.view(-1, self.tile_rows, self.tile_cols)
-            raw_values = orig_vals_view[gather_tile_indices].view(-1)
+            raw_values = _smart_index(orig_vals_view, gather_tile_indices).view(-1)
 
         # 3. 识别 Internal Nodes (必须保留)
         # 根据 window_ids 生成内部节点的全集
@@ -466,10 +492,17 @@ class BCSRSampler:
         expanded_win = torch.repeat_interleave(window_ids, self.tile_rows)
         offsets = torch.tile(torch.arange(self.tile_rows, device=device), (num_windows,))
         internal_nodes_global = expanded_win * self.tile_rows + offsets
+        # 过滤 padding 行（>= g.num_nodes），避免后续映射越界
+        if internal_nodes_global.numel() > 0:
+            internal_nodes_global = internal_nodes_global[internal_nodes_global < g.num_nodes]
+        num_internal_nodes = int(internal_nodes_global.numel())
+        total_nodes = g.num_windows * self.tile_rows
         
         # 4. 识别 External Nodes (Halo)
-        # 过滤掉 -1
-        mask_valid_edge = (raw_col_indices != -1)
+        # 过滤掉 -1 和越界 ID
+        mask_valid_edge = (raw_col_indices >= 0) & (raw_col_indices < g.num_nodes)
+        raw_col_indices = raw_col_indices.clone()
+        raw_col_indices[~mask_valid_edge] = -1
         valid_neighbors = raw_col_indices[mask_valid_edge].long()
         
         # 找出所有涉及的 Unique Neighbors
@@ -482,12 +515,11 @@ class BCSRSampler:
         
         # 技巧：构建一个全图 mask (如果显存允许) 或者使用 searchsorted
         # 考虑到 Reddit 只有 20万节点，全图 Mask 很便宜 (200KB)
-        is_internal_mask = torch.zeros(g.num_nodes, dtype=torch.bool, device=device)
+        is_internal_mask = torch.zeros(total_nodes, dtype=torch.bool, device=device)
         is_internal_mask[internal_nodes_global] = True
         
         # 标记哪些 neighbor 是 external
-        # 注意：这里可能 valid_neighbors 里有越界值(如果预处理没做好)，加个 clamp 保护
-        valid_neighbors = torch.clamp(valid_neighbors, max=g.num_nodes-1)
+        # valid_neighbors 已经做过范围过滤，这里无需 clamp
         
         # 只有那些不是 internal 的 unique neighbor 才是 external candidates
         is_external_node = ~is_internal_mask[unique_neighbors]
@@ -525,7 +557,7 @@ class BCSRSampler:
         new_col_indices_flat = torch.full_like(raw_col_indices, -1)
         
         # 只对有效边进行重映射
-        valid_indices_mask = (raw_col_indices != -1)
+        valid_indices_mask = (raw_col_indices >= 0) & (raw_col_indices < g.num_nodes)
         valid_global_ids = raw_col_indices[valid_indices_mask].long()
         
         mapped_ids = global_to_local[valid_global_ids]
@@ -658,7 +690,8 @@ class BCSRSampler:
         return subgraph
 
 
-    def sample_dps_online(self, g: BCSRGraph, seed_window_ids: torch.Tensor, fanouts: List[int] = [5, 5]) -> BCSRGraph:
+    def sample_dps_online(self, g: BCSRGraph, seed_window_ids: torch.Tensor, fanouts: List[int] = [5, 5],
+                          dry_run: bool = False) -> BCSRGraph:
         """[DPS 在线接口] 探测 (Probe) + 重组 (Repack)"""
         device = seed_window_ids.device
         
@@ -675,7 +708,7 @@ class BCSRSampler:
         
         if seed_nodes.numel() == 0:
             # 返回空图避免报错
-            return self.repack_subgraph(g, torch.tensor([], device=device, dtype=torch.long))
+            return self.repack_subgraph(g, torch.tensor([], device=device, dtype=torch.long), dry_run=dry_run)
         
         # 2. 探测 (Probe)
         probe_sampler = BCSRSampler(
@@ -718,6 +751,6 @@ class BCSRSampler:
             unique_windows = seed_window_ids 
             
         # 4. 重组 (Repack)
-        subgraph = self.repack_subgraph(g, unique_windows)
+        subgraph = self.repack_subgraph(g, unique_windows, dry_run=dry_run)
         
         return subgraph

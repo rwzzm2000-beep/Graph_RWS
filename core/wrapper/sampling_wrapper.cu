@@ -420,6 +420,14 @@ std::pair<std::vector<std::vector<torch::Tensor>>, std::vector<SamplingTimingRes
 
         // 3. 为下一层准备 (使用当前层采样出的列 tensors[1])
         if (&fanout != &fanouts.back()) {
+             // 防御性过滤：丢弃越界列索引，避免后续 window_id 越界访问
+             if (num_global_nodes > 0 && tensors.size() > 1) {
+                 auto cols = tensors[1];
+                 if (cols.numel() > 0) {
+                     auto invalid_mask = (cols < 0) | (cols >= num_global_nodes);
+                     cols.masked_fill_(invalid_mask, -1);
+                 }
+             }
              auto next_pair = prepare_windows_and_masks(tensors[1], tile_rows, stream);
              curr_active_windows = next_pair.first;
              curr_masks = next_pair.second;

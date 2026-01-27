@@ -272,7 +272,8 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
                              static_scores: torch.Tensor = None,
                              window_part_ids: torch.Tensor = None,
                              part_ranges: torch.Tensor = None,
-                             hacs_params: Dict[str, Any] = None):
+                             hacs_params: Dict[str, Any] = None,
+                             partition_book_path: str = None):
     """
     [DPS Index-Based Preprocess] 
     仅运行采样算法生成 Partition Book (Window IDs)，不保存物理子图。
@@ -286,6 +287,7 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
     dps_cfg = config.get('DPS', {})
     max_edges_threshold = int(dps_cfg.get('max_partition_edges', 2000000))
     probe_step = int(dps_cfg.get('probe_step_size', 50))
+    probe_dry_run = True
     
     tile_rows = int(config.get('tile_rows', 16))
     tile_cols = int(config.get('tile_cols', 8))
@@ -323,8 +325,21 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
 
     # 将原图转换为 BCSR (这就是训练要用的图，常驻显存)
     # 注意：为了预处理采样速度，我们先把图放到 device 上
-    bcsr_full = BCSRGraph.from_dgl(g_raw.to(device), tile_rows, tile_cols)
+    # bcsr_full = BCSRGraph.from_dgl(g_raw.to(device), tile_rows, tile_cols)
     
+    bcsr_full = BCSRGraph.from_dgl(g_raw, tile_rows, tile_cols)
+    
+    # 2. 手动执行 Pin Memory (让 GPU 能直接读取 CPU 内存)
+    if hasattr(bcsr_full, 'window_offset') and not bcsr_full.window_offset.is_cuda:
+        bcsr_full.window_offset = bcsr_full.window_offset.pin_memory()
+        
+    if hasattr(bcsr_full, 'original_col_indices') and not bcsr_full.original_col_indices.is_cuda:
+        bcsr_full.original_col_indices = bcsr_full.original_col_indices.pin_memory()
+        
+    if hasattr(bcsr_full, 'values_condensed') and bcsr_full.values_condensed is not None:
+        if not bcsr_full.values_condensed.is_cuda:
+            bcsr_full.values_condensed = bcsr_full.values_condensed.pin_memory()
+
     # 2. 初始化采样器
     sampler = BCSRSampler(
         fanouts=config.get('fanouts', [10, 10]),
@@ -349,17 +364,51 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
     # 将训练节点转换为 Window ID 并去重
     train_idx_gpu = train_idx.to(device)
     train_window_ids = torch.unique(torch.div(train_idx_gpu, tile_rows, rounding_mode='floor'))
-    
-    # 打乱顺序
-    perm = torch.randperm(train_window_ids.size(0), device=device)
-    shuffled_windows = train_window_ids[perm]
-    
-    # 4. 采样循环
+
+    # 打乱顺序 (支持断点续跑)
     partition_book = []  # 存储 List[Tensor(WindowIDs)]
-    
-    total_windows = shuffled_windows.size(0)
     cursor = 0
     part_id = 0
+    shuffled_windows = None
+
+    partial_path = None
+    if partition_book_path:
+        partial_path = partition_book_path.replace('.pt', '_partial.pt')
+        if os.path.exists(partial_path):
+            try:
+                resume_state = torch.load(partial_path, weights_only=False)
+                state_windows = resume_state.get('shuffled_windows')
+                state_cursor = int(resume_state.get('cursor', 0))
+                state_book = resume_state.get('partition_book', [])
+                if isinstance(state_windows, torch.Tensor) and state_windows.numel() == train_window_ids.numel():
+                    shuffled_windows = state_windows.to(device)
+                    cursor = max(0, state_cursor)
+                    partition_book = state_book
+                    part_id = int(resume_state.get('part_id', len(partition_book)))
+                    print(f"  [DPS] Resuming from checkpoint: {partial_path} (cursor={cursor}, parts={part_id})")
+                else:
+                    print(f"  [DPS] Checkpoint mismatch, ignoring: {partial_path}")
+            except Exception as e:
+                print(f"  [DPS] Failed to load checkpoint {partial_path}: {e}")
+
+    if shuffled_windows is None:
+        perm = torch.randperm(train_window_ids.size(0), device=device)
+        shuffled_windows = train_window_ids[perm]
+
+    # 4. 采样循环
+    total_windows = shuffled_windows.size(0)
+    if cursor >= total_windows:
+        cursor = 0
+        partition_book = []
+        part_id = 0
+
+    # Probe 仅使用一层 fanout，加速预处理
+    full_fanouts = config.get('fanouts', [10, 10])
+    probe_fanouts = full_fanouts[:1] if len(full_fanouts) > 1 else full_fanouts
+    base_step = max(1, probe_step)
+    min_step = max(1, base_step // 4)
+    max_step = max(base_step, base_step * 4)
+    checkpoint_interval = 200
     
     t0 = time.time()
     
@@ -368,21 +417,31 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
         accepted_subgraph = None 
         
         # --- 探测阶段 (Probing) ---
+        dynamic_step = base_step
         while cursor < total_windows:
-            end_ptr = min(cursor + probe_step, total_windows)
+            end_ptr = min(cursor + dynamic_step, total_windows)
             new_seeds = shuffled_windows[cursor : end_ptr]
             temp_seeds = torch.cat([current_valid_seeds, new_seeds])
             
             # 使用在线采样探测子图大小
             # sample_dps_online 内部调用了 repack_subgraph，返回的图是紧凑的
             # temp_bcsr = sampler.sample_dps_online(bcsr_full, temp_seeds)
-            temp_bcsr = sampler.sample_dps_online(bcsr_full, temp_seeds, fanouts=sampler.fanouts)
+            temp_bcsr = sampler.sample_dps_online(
+                bcsr_full,
+                temp_seeds,
+                fanouts=probe_fanouts,
+                dry_run=probe_dry_run
+            )
             
             # 计算负载 (边数或 Tile 数)
-            if temp_bcsr.values_condensed is not None:
+            if hasattr(temp_bcsr, 'approx_values'):
+                current_load = int(temp_bcsr.approx_values)
+            elif temp_bcsr.values_condensed is not None:
                 current_load = temp_bcsr.values_condensed.numel()
-            else:
+            elif temp_bcsr.original_col_indices is not None:
                 current_load = temp_bcsr.original_col_indices.numel()
+            else:
+                current_load = 0
 
             is_first_step = (current_valid_seeds.size(0) == 0)
             
@@ -391,6 +450,11 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
                 accepted_subgraph = temp_bcsr
                 current_valid_seeds = temp_seeds
                 cursor = end_ptr # 指针推进
+                # 动态调整步长：远离阈值加速，接近阈值减速
+                if current_load < int(0.5 * max_edges_threshold):
+                    dynamic_step = min(dynamic_step * 2, max_step)
+                elif current_load > int(0.85 * max_edges_threshold):
+                    dynamic_step = max(dynamic_step // 2, min_step)
                 if current_load >= max_edges_threshold: 
                     break # 满了，提交当前分区
             else:
@@ -422,6 +486,18 @@ def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx
         if part_id % 20 == 0:
             elapsed = time.time() - t0
             print(f"    [DPS-Index] Generated {part_id} partitions. Progress {cursor}/{total_windows}. Time: {elapsed:.1f}s")
+        if partial_path and (part_id % checkpoint_interval == 0):
+            try:
+                torch.save({
+                    'partition_book': partition_book,
+                    'shuffled_windows': shuffled_windows.cpu(),
+                    'cursor': cursor,
+                    'part_id': part_id,
+                    'total_windows': total_windows
+                }, partial_path)
+                print(f"  [DPS] Checkpoint saved: {partial_path}")
+            except Exception as e:
+                print(f"  [DPS] Checkpoint save failed: {e}")
 
     print(f"  [DPS] Done. Generated {len(partition_book)} partitions (Index-Only).")
     
@@ -827,14 +903,14 @@ class OGBAdapter(BaseAdapter):
         feat = g.ndata['feat']
 
         # [改动] 2. 转为无向图
-        g = dgl.to_bidirected(g)
+        # g = dgl.to_bidirected(g)
 
         # 这一步会去除重复的 u->v 边，只保留一条
-        g = dgl.to_simple(g)
+        # g = dgl.to_simple(g)
 
-        # [改动] 3. 添加自环
-        g = dgl.remove_self_loop(g)
-        g = dgl.add_self_loop(g)
+        # # [改动] 3. 添加自环
+        # g = dgl.remove_self_loop(g)
+        # g = dgl.add_self_loop(g)
 
         # [改动] 4. 计算对称归一化权重 (Symmetric Normalization)
         # 计算对称归一化权重 (Symmetric Normalization)
@@ -1089,7 +1165,8 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
                 static_scores=static_scores,
                 window_part_ids=window_part_ids,
                 part_ranges=part_ranges,
-                hacs_params=hacs_params
+                hacs_params=hacs_params,
+                partition_book_path=partition_book_path
             )
             
             partition_book = dps_book

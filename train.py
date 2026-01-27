@@ -107,11 +107,41 @@ def main():
             raise e
 
     # 3. 处理图结构 (Graph Structure)
-    # [关键] Index-Based DPS 必须要求图结构在 GPU 上，以便进行高速切图
+    # DPS 默认希望图结构在 GPU 上，但超大图必须保留在 CPU(UVA)以避免 OOM。
     if train_mode == 'DPS':
         if not bundle.bcsr_full.window_offset.is_cuda:
-            print("  -> [DPS Requirement] Moving Graph Structure to GPU...")
-            bundle.bcsr_full.to(device)
+            # 估算图结构占用，避免盲目搬运导致 OOM
+            bcsr = bundle.bcsr_full
+            est_bytes = 0
+            if bcsr.window_offset is not None:
+                est_bytes += bcsr.window_offset.numel() * bcsr.window_offset.element_size()
+            if bcsr.original_col_indices is not None:
+                est_bytes += bcsr.original_col_indices.numel() * bcsr.original_col_indices.element_size()
+            if bcsr.values_condensed is not None:
+                est_bytes += bcsr.values_condensed.numel() * bcsr.values_condensed.element_size()
+            est_gib = est_bytes / (1024 ** 3)
+
+            if use_uva:
+                print(f"  -> [DPS] Keeping Graph on CPU (UVA). Estimated size: {est_gib:.2f} GiB")
+            else:
+                can_move = True
+                if device.type == 'cuda' and torch.cuda.is_available():
+                    free_mem, total_mem = torch.cuda.mem_get_info(device)
+                    if est_bytes > int(0.8 * free_mem):
+                        can_move = False
+                        free_gib = free_mem / (1024 ** 3)
+                        print(f"  -> [DPS] Graph too large for GPU (need {est_gib:.2f} GiB, free {free_gib:.2f} GiB).")
+                if can_move:
+                    print("  -> [DPS] Moving Graph Structure to GPU...")
+                    try:
+                        bundle = bundle._replace(
+                            bcsr_full=bundle.bcsr_full.to(device)
+                        )
+                    except RuntimeError as e:
+                        print(f"  -> [Warning] GPU OOM while moving graph: {e}")
+                        print("  -> [Fallback] Keep Graph on CPU (UVA recommended).")
+                else:
+                    print("  -> [Fallback] Keeping Graph on CPU for DPS.")
     elif train_mode == 'node' or train_mode == 'full':
         # 其他模式如果显存允许，也可以把图放 GPU
         if not use_uva: # UVA 模式下通常图也在 GPU，这里做个兜底
