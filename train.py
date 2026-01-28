@@ -28,6 +28,29 @@ import torch
 import torch.nn.functional as F
 
 
+def _build_eval_partition_book(eval_idx: torch.Tensor,
+                               tile_rows: int,
+                               ref_partition_book):
+    if eval_idx is None or eval_idx.numel() == 0:
+        return []
+
+    eval_windows = torch.unique(torch.div(eval_idx.cpu(), tile_rows, rounding_mode='floor'))
+    eval_windows, _ = torch.sort(eval_windows)
+
+    if ref_partition_book:
+        total = 0
+        for part in ref_partition_book:
+            total += int(part.numel())
+        avg = max(1, int(round(total / max(1, len(ref_partition_book)))))
+    else:
+        avg = 1024
+
+    eval_book = []
+    for i in range(0, eval_windows.numel(), avg):
+        eval_book.append(eval_windows[i:i + avg])
+    return eval_book
+
+
 def main():
     # torch.set_float32_matmul_precision('high')
     
@@ -44,6 +67,7 @@ def main():
     print(f"Running on GPU: {gpu_name}\n")
 
     config = load_config(args.config)
+    tile_rows = int(config.get('tile_rows', 16))
 
     enable_save_model = config.get('save_model', False)
     enable_save_result = config.get('save_result', True)
@@ -232,9 +256,14 @@ def main():
     # 初始化 Loaders 和 Mask
     dps_loader = None
     baps_loader = None
+    val_loader = None
+    test_loader = None
     train_bool_mask = None
     val_bool_mask = None
     test_bool_mask = None
+
+    eval_partition_book_val = None
+    eval_partition_book_test = None
 
     # 只有 DPS 和 BAPS 需要 train_bool_mask 来过滤子图
     if train_mode in ['DPS', 'BAPS']:
@@ -249,20 +278,25 @@ def main():
         global_train_idx = None
 
         if train_mode == "DPS":
+            preprocess_mode = str(config.get('preprocess_mode', 'none')).lower()
             # DPS 正确做法：train_idx(=super id) -> super_map -> global id
-            if getattr(bundle, "super_map", None) is None:
-                # 这里说明你的 super_map 在更早的地方已经被清掉了（或压根没加载出来）
-                # 临时兜底：把 train_idx 当作 global id（不一定正确，但至少不会崩）
-                print("[Warning] bundle.super_map is None in DPS; fallback to using train_idx as global id (may be WRONG).")
-                global_train_idx = bundle.train_idx.to(device)
-                global_val_idx = bundle.val_idx.to(device)
-                global_test_idx = bundle.test_idx.to(device)
-            else:
+            if getattr(bundle, "super_map", None) is not None:
+                print("[Index] Using super_map to map train/val/test indices.")
                 super_map_dev = bundle.super_map.to(device)
                 global_train_idx = super_map_dev[bundle.train_idx.to(device)]
                 global_val_idx = super_map_dev[bundle.val_idx.to(device)]
                 global_test_idx = super_map_dev[bundle.test_idx.to(device)]
                 del super_map_dev
+            elif preprocess_mode == 'none':
+                print("[Index] No preprocessing detected. Using raw indices as global ids.")
+                global_train_idx = bundle.train_idx.to(device)
+                global_val_idx = bundle.val_idx.to(device)
+                global_test_idx = bundle.test_idx.to(device)
+            else:
+                print("[Warning] Preprocess is active but super_map is MISSING; using raw indices (may be wrong).")
+                global_train_idx = bundle.train_idx.to(device)
+                global_val_idx = bundle.val_idx.to(device)
+                global_test_idx = bundle.test_idx.to(device)
         else:
             # BAPS：一般 train_idx 就是 global id
             global_train_idx = bundle.train_idx.to(device)
@@ -274,6 +308,9 @@ def main():
             test_bool_mask = torch.zeros(num_orig_nodes, dtype=torch.bool, device=device)
             val_bool_mask[global_val_idx] = True
             test_bool_mask[global_test_idx] = True
+            if partition_book:
+                eval_partition_book_val = _build_eval_partition_book(global_val_idx, tile_rows, partition_book)
+                eval_partition_book_test = _build_eval_partition_book(global_test_idx, tile_rows, partition_book)
 
         # ===== Probe（一定要放在置 mask 之后）=====
         true_cnt = int(train_bool_mask.sum().item())
@@ -301,6 +338,18 @@ def main():
         
         # 复用 baps_loader 变量，因为它本质上就是一个 PartitionDataLoader
         dps_loader = PartitionDataLoader(num_partitions=num_parts, batch_size=part_batch_size, device=device)
+        if eval_partition_book_val:
+            val_loader = PartitionDataLoader(num_partitions=len(eval_partition_book_val),
+                                              batch_size=part_batch_size,
+                                              device=device)
+        else:
+            val_loader = None
+        if eval_partition_book_test:
+            test_loader = PartitionDataLoader(num_partitions=len(eval_partition_book_test),
+                                               batch_size=part_batch_size,
+                                               device=device)
+        else:
+            test_loader = None
         
     elif train_mode == 'BAPS':
         print(f"[BAPS] Initializing Partition Loader...")
@@ -412,9 +461,9 @@ def main():
                     bundle.labels,
                     val_bool_mask,
                     device,
-                    partition_loader=dps_loader,
+                    partition_loader=val_loader if val_loader is not None else dps_loader,
                     sampler=sampler,
-                    partition_book=partition_book
+                    partition_book=eval_partition_book_val if eval_partition_book_val is not None else partition_book
                 )
             else:
                 val_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.val_idx, device)
@@ -436,8 +485,6 @@ def main():
         # 打印表格行
         logger.log_epoch(epoch, dt, train_loss, train_acc, val_acc, epoch_timer.get_epoch_stats())
 
-        torch.cuda.empty_cache()
-        
         # Early Stopping
         if epoch - best_epoch > patience:
             print("\nEarly stopping triggered!")
@@ -465,9 +512,9 @@ def main():
             bundle.labels,
             test_bool_mask,
             device,
-            partition_loader=dps_loader,
+            partition_loader=test_loader if test_loader is not None else dps_loader,
             sampler=sampler,
-            partition_book=partition_book
+            partition_book=eval_partition_book_test if eval_partition_book_test is not None else partition_book
         )
     else:
         test_acc = evaluate(model, bundle.bcsr_full, bundle.features, bundle.labels, bundle.test_idx, device)

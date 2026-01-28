@@ -279,6 +279,133 @@ def _get_mem_available_bytes() -> int:
     return -1
 
 
+def _bcsr_bin_paths(cache_path: str):
+    meta_path = cache_path.replace('.pt', '_bcsr_meta.pt')
+    off_path = cache_path.replace('.pt', '_bcsr_window_offset.bin')
+    col_path = cache_path.replace('.pt', '_bcsr_col_indices.bin')
+    val_path = cache_path.replace('.pt', '_bcsr_values.bin')
+    return meta_path, off_path, col_path, val_path
+
+
+def _estimate_bcsr_bytes(bcsr: BCSRGraph) -> int:
+    total = 0
+    if getattr(bcsr, 'window_offset', None) is not None:
+        total += bcsr.window_offset.numel() * bcsr.window_offset.element_size()
+    if getattr(bcsr, 'original_col_indices', None) is not None:
+        total += bcsr.original_col_indices.numel() * bcsr.original_col_indices.element_size()
+    if getattr(bcsr, 'values_condensed', None) is not None:
+        total += bcsr.values_condensed.numel() * bcsr.values_condensed.element_size()
+    return int(total)
+
+
+def _make_bcsr_stub(bcsr: BCSRGraph) -> BCSRGraph:
+    device = torch.device('cpu')
+    window_offset = torch.zeros(1, dtype=torch.int64, device=device)
+    col_indices = torch.zeros(1, dtype=torch.int32, device=device)
+    values = torch.zeros(1, dtype=torch.float32, device=device)
+    stub = BCSRGraph(
+        num_nodes=int(bcsr.num_nodes),
+        num_edges=0,
+        tile_rows=int(bcsr.tile_rows),
+        tile_cols=int(bcsr.tile_cols),
+        window_offset=window_offset,
+        original_col_indices=col_indices,
+        values_condensed=values,
+        device=device,
+        num_rows=int(bcsr.num_rows),
+        num_cols=int(bcsr.num_cols)
+    )
+    stub.num_windows = int(getattr(bcsr, 'num_windows', 0))
+    stub.is_stub = True
+    return stub
+
+
+def _save_bcsr_bins(bcsr: BCSRGraph, cache_path: str) -> bool:
+    meta_path, off_path, col_path, val_path = _bcsr_bin_paths(cache_path)
+    try:
+        window_offset = bcsr.window_offset.detach().cpu().to(torch.int64)
+        col_indices = bcsr.original_col_indices.detach().cpu().to(torch.int32)
+        values = bcsr.values_condensed.detach().cpu().to(torch.float32)
+
+        window_offset.numpy().tofile(off_path)
+        col_indices.numpy().tofile(col_path)
+        values.numpy().tofile(val_path)
+
+        meta = {
+            'num_nodes': int(bcsr.num_nodes),
+            'num_edges': int(bcsr.num_edges),
+            'num_rows': int(bcsr.num_rows),
+            'num_cols': int(bcsr.num_cols),
+            'tile_rows': int(bcsr.tile_rows),
+            'tile_cols': int(bcsr.tile_cols),
+            'num_windows': int(getattr(bcsr, 'num_windows', 0)),
+            'window_offset_len': int(window_offset.numel()),
+            'col_indices_len': int(col_indices.numel()),
+            'values_len': int(values.numel())
+        }
+        torch.save(meta, meta_path)
+        return True
+    except Exception as e:
+        print(f"[Data] Failed to save BCSR bins: {e}")
+        return False
+
+
+def _load_bcsr_bins(cache_path: str) -> (BCSRGraph, bool):
+    meta_path, off_path, col_path, val_path = _bcsr_bin_paths(cache_path)
+    if not (os.path.exists(meta_path) and os.path.exists(off_path) and
+            os.path.exists(col_path) and os.path.exists(val_path)):
+        return None, False
+
+    meta = torch.load(meta_path, weights_only=False)
+    off_len = int(meta.get('window_offset_len', 0))
+    col_len = int(meta.get('col_indices_len', 0))
+    val_len = int(meta.get('values_len', 0))
+    if off_len <= 0 or col_len <= 0 or val_len <= 0:
+        return None, False
+
+    off_bytes = off_len * 8
+    col_bytes = col_len * 4
+    val_bytes = val_len * 4
+    total_bytes = off_bytes + col_bytes + val_bytes
+
+    mem_avail = _get_mem_available_bytes()
+    use_mmap = (mem_avail > 0 and total_bytes * 2 > mem_avail)
+
+    if use_mmap:
+        off_np = np.memmap(off_path, dtype=np.int64, mode='r', shape=(off_len,))
+        col_np = np.memmap(col_path, dtype=np.int32, mode='r', shape=(col_len,))
+        val_np = np.memmap(val_path, dtype=np.float32, mode='r', shape=(val_len,))
+        print(f"[Data] BCSR loaded via memmap: {off_path}")
+    else:
+        off_np = np.fromfile(off_path, dtype=np.int64)
+        col_np = np.fromfile(col_path, dtype=np.int32)
+        val_np = np.fromfile(val_path, dtype=np.float32)
+        print(f"[Data] BCSR loaded from binary: {off_path}")
+
+    if off_np.size != off_len or col_np.size != col_len or val_np.size != val_len:
+        print("[Data] BCSR binary shape mismatch, ignoring bins.")
+        return None, False
+
+    window_offset = torch.from_numpy(off_np)
+    col_indices = torch.from_numpy(col_np)
+    values = torch.from_numpy(val_np)
+
+    bcsr = BCSRGraph(
+        num_nodes=int(meta['num_nodes']),
+        num_edges=int(meta['num_edges']),
+        tile_rows=int(meta['tile_rows']),
+        tile_cols=int(meta['tile_cols']),
+        window_offset=window_offset,
+        original_col_indices=col_indices,
+        values_condensed=values,
+        device=torch.device('cpu'),
+        num_rows=int(meta['num_rows']),
+        num_cols=int(meta['num_cols'])
+    )
+    bcsr.num_windows = int(meta.get('num_windows', bcsr.num_windows))
+    return bcsr, use_mmap
+
+
 def process_dps_static_graph(config, g_raw, features, labels, train_idx, val_idx, test_idx, device,
                              static_scores: torch.Tensor = None,
                              window_part_ids: torch.Tensor = None,
@@ -1098,16 +1225,25 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
     partition_book_path = cache_path.replace('.pt', '_partition_book.pt')
     lite_cache_path = cache_path.replace('.pt', '_lite.pt')
     bin_feat_path = cache_path.replace('.pt', '_feat.bin')
+    bcsr_meta_path, bcsr_off_path, bcsr_col_path, bcsr_val_path = _bcsr_bin_paths(cache_path)
     features_from_mmap = False
+    bcsr_from_mmap = False
 
     # 3. 加载或处理逻辑
     partition_book = None
     
-    if os.path.exists(cache_path):
-        print(f"[Data] Loading cached dataset from: {cache_path}")
+    has_cache = os.path.exists(cache_path)
+    has_lite = os.path.exists(lite_cache_path)
+    bundle = None
+    need_reprocess = False
+    if has_cache or has_lite:
+        if has_lite:
+            print(f"[Data] Loading cached dataset from lite: {lite_cache_path}")
+        else:
+            print(f"[Data] Loading cached dataset from: {cache_path}")
 
         lite_loaded = False
-        if os.path.exists(lite_cache_path):
+        if has_lite:
             try:
                 bundle = torch.load(lite_cache_path, weights_only=False)
                 lite_loaded = True
@@ -1120,16 +1256,36 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
             print("[Data] Lite cache found but binary features missing; falling back to full cache.")
             lite_loaded = False
 
-        if not lite_loaded:
-            bundle = torch.load(cache_path, weights_only=False)
+        if lite_loaded and getattr(bundle.bcsr_full, 'is_stub', False) and (not os.path.exists(bcsr_meta_path)):
+            print("[Data] Lite cache found but BCSR bins missing; falling back to full cache.")
+            lite_loaded = False
 
-        # 尝试加载 partition_book (如果是 DPS 或 BAPS/METIS 生成的)
-        if os.path.exists(partition_book_path):
-            partition_book = torch.load(partition_book_path, weights_only=False)
-            bundle = bundle._replace(partition_book=partition_book)
+        if not lite_loaded:
+            if not has_cache:
+                print("[Data] Lite cache load failed and full cache missing; will reprocess.")
+                need_reprocess = True
+            else:
+                bundle = torch.load(cache_path, weights_only=False)
+        # Lite cache loaded; defer to bin loaders for features/BCSR.
+
+        if bundle is not None:
+            # 尝试加载 partition_book (如果是 DPS 或 BAPS/METIS 生成的)
+            if os.path.exists(partition_book_path):
+                partition_book = torch.load(partition_book_path, weights_only=False)
+                bundle = bundle._replace(partition_book=partition_book)
+
+        # 尝试从 BCSR 二进制文件快速加载图结构
+        if bundle is not None and os.path.exists(bcsr_meta_path) and os.path.exists(bcsr_off_path):
+            need_bcsr = lite_loaded or (getattr(bundle.bcsr_full, 'num_windows', 0) == 0)
+            if need_bcsr:
+                bcsr_loaded, bcsr_from_mmap = _load_bcsr_bins(cache_path)
+                if bcsr_loaded is not None:
+                    bundle = bundle._replace(bcsr_full=bcsr_loaded)
+                else:
+                    print("[Data] BCSR bins missing or invalid; using bundle.bcsr_full.")
 
         # 尝试从二进制文件快速加载特征
-        if os.path.exists(bin_feat_path):
+        if bundle is not None and os.path.exists(bin_feat_path):
             num_rows = int(bundle.labels.shape[0])
             file_size = os.path.getsize(bin_feat_path)
             if num_rows > 0 and (file_size % (num_rows * 4) == 0):
@@ -1152,7 +1308,7 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
                 print(f"[Data] Binary feature shape mismatch, ignoring: {bin_feat_path}")
 
         # 若已存在完整缓存但没有二进制特征，创建二进制加速文件供下次使用
-        if not os.path.exists(bin_feat_path):
+        if bundle is not None and (not os.path.exists(bin_feat_path)):
             feat_bytes = int(bundle.features.numel()) * bundle.features.element_size()
             if feat_bytes > (5 * 1024 ** 3):
                 try:
@@ -1163,7 +1319,28 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
                     print(f"[Data] Lite cache saved: {lite_cache_path}")
                 except Exception as e:
                     print(f"[Data] Failed to save binary features: {e}")
+
+        # 若已存在完整缓存但没有 BCSR bins，创建 BCSR bins 以加速后续加载
+        if bundle is not None and (not os.path.exists(bcsr_meta_path)):
+            if not getattr(bundle.bcsr_full, 'is_stub', False):
+                bcsr_bytes = _estimate_bcsr_bytes(bundle.bcsr_full)
+                if bcsr_bytes > (5 * 1024 ** 3):
+                    if _save_bcsr_bins(bundle.bcsr_full, cache_path):
+                        lite_bundle = bundle
+                        if os.path.exists(bin_feat_path):
+                            lite_bundle = lite_bundle._replace(
+                                features=torch.empty((0, 0), dtype=bundle.features.dtype)
+                            )
+                        lite_bundle = lite_bundle._replace(bcsr_full=_make_bcsr_stub(bundle.bcsr_full))
+                        try:
+                            torch.save(lite_bundle, lite_cache_path)
+                            print(f"[Data] Lite cache updated with BCSR stub: {lite_cache_path}")
+                        except Exception as e:
+                            print(f"[Data] Failed to update lite cache: {e}")
     else:
+        need_reprocess = True
+
+    if need_reprocess:
         print(f"[Data] Cache not found. Processing dataset (Mode={train_mode}, Preprocess={preprocess_mode})...")
         
         # [Step 1] 初始加载
@@ -1260,16 +1437,36 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
 
         # 保存缓存
         feat_bytes = int(bundle.features.numel()) * bundle.features.element_size()
-        if feat_bytes > (5 * 1024 ** 3):
+        bcsr_bytes = _estimate_bcsr_bytes(bundle.bcsr_full)
+        save_feat_bin = feat_bytes > (5 * 1024 ** 3)
+        save_bcsr_bin = bcsr_bytes > (5 * 1024 ** 3)
+
+        lite_bundle = bundle
+        if save_feat_bin:
             try:
                 print(f"[Data] Saving features to binary for faster startup: {bin_feat_path}")
                 bundle.features.cpu().numpy().tofile(bin_feat_path)
-                lite_bundle = bundle._replace(features=torch.empty((0, 0), dtype=bundle.features.dtype))
+                lite_bundle = lite_bundle._replace(features=torch.empty((0, 0), dtype=bundle.features.dtype))
+            except Exception as e:
+                print(f"[Data] Failed to save binary features: {e}")
+                save_feat_bin = False
+
+        if save_bcsr_bin:
+            if _save_bcsr_bins(bundle.bcsr_full, cache_path):
+                lite_bundle = lite_bundle._replace(bcsr_full=_make_bcsr_stub(bundle.bcsr_full))
+            else:
+                save_bcsr_bin = False
+
+        if save_feat_bin or save_bcsr_bin:
+            try:
                 torch.save(lite_bundle, lite_cache_path)
                 print(f"[Data] Lite cache saved: {lite_cache_path}")
             except Exception as e:
-                print(f"[Data] Failed to save binary features: {e}")
-        torch.save(bundle, cache_path)
+                print(f"[Data] Failed to save lite cache: {e}")
+            print("[Data] Skipping full cache to reduce disk usage.")
+        else:
+            torch.save(bundle, cache_path)
+
         if partition_book is not None:
             torch.save(partition_book, partition_book_path)
 
@@ -1334,15 +1531,20 @@ def load_dataset(config: Dict[str, Any], device) -> DataBundle:
         # 如果是 DPS 模式，bcsr 可能已经在 GPU 上了，此时不能 pin
         if hasattr(bcsr, 'window_offset'): 
             if not bcsr.window_offset.is_cuda:
-                bcsr.window_offset = bcsr.window_offset.pin_memory()
+                if bcsr_from_mmap:
+                    print("[Data] Skip pin_memory for memmap BCSR.")
+                else:
+                    bcsr.window_offset = bcsr.window_offset.pin_memory()
 
         if hasattr(bcsr, 'original_col_indices'): 
             if not bcsr.original_col_indices.is_cuda:
-                bcsr.original_col_indices = bcsr.original_col_indices.pin_memory()
+                if not bcsr_from_mmap:
+                    bcsr.original_col_indices = bcsr.original_col_indices.pin_memory()
 
         if hasattr(bcsr, 'values_condensed') and bcsr.values_condensed is not None: 
             if not bcsr.values_condensed.is_cuda:
-                bcsr.values_condensed = bcsr.values_condensed.pin_memory()
+                if not bcsr_from_mmap:
+                    bcsr.values_condensed = bcsr.values_condensed.pin_memory()
         
         # Labels 通常很小，直接放 GPU
         if not labels.is_cuda:

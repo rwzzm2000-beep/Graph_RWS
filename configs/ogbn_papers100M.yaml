@@ -35,7 +35,7 @@ DPS:
 # [Mode: BAPS] 动态块对齐分区配置
 BAPS:
   num_partitions: 5000
-  batch_partition_size: 5
+  batch_partition_size: 20
 
 # [Mode: node] 点采样配置
 node:
@@ -47,16 +47,16 @@ full:
 
 # ================= [5. GNN 模型结构] =================
 # 100M 数据集通常较浅层网络即可，深层极难收敛
-fanouts: [20, 10, 5]
-hidden_size: 256
+fanouts: [20, 10]
+hidden_size: 128
 num_classes: 172
-dropout: 0.2
+dropout: 0.1
 residual: true
 normalize_features: true
 
 # ================= [6. 训练超参数] =================
-epochs: 120
-lr: 0.0015
+epochs: 100
+lr: 0.003
 weight_decay: 0.0005
 patience: 30
 eval_interval: 5

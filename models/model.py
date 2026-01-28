@@ -57,6 +57,9 @@ class GCN_BCSR(nn.Module):
         self.layers.append(BCSRGraphConv(hidden_size, num_classes, warps_per_block=warps_per_block))
         
         self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
+        self.norms = nn.ModuleList()
+        for _ in range(num_layers - 1):
+            self.norms.append(nn.LayerNorm(hidden_size))
         
         if residual:
             self.residual_projs = nn.ModuleList()
@@ -77,6 +80,8 @@ class GCN_BCSR(nn.Module):
             for proj in self.residual_projs:
                 if proj is not None:
                     nn.init.kaiming_uniform_(proj.weight, nonlinearity='relu')
+        for norm in self.norms:
+            norm.reset_parameters()
     
     def _ensure_graph_list(self, graphs: Union[BCSRGraph, List[BCSRGraph]]) -> List[BCSRGraph]:
         if isinstance(graphs, BCSRGraph):
@@ -253,6 +258,8 @@ class GCN_BCSR(nn.Module):
             # 5. 激活/Dropout
             if l < len(self.layers) - 1:
                 h = self.activation(h)
+                if self.norms:
+                    h = self.norms[l](h)
                 if self.dropout_layer is not None:
                     h = self.dropout_layer(h)
                     
@@ -273,4 +280,6 @@ class GCN_BCSR(nn.Module):
             h = layer(g_copy, h)
             if l < len(self.layers) - 1:
                 h = self.activation(h)
+                if self.norms:
+                    h = self.norms[l](h)
         return h

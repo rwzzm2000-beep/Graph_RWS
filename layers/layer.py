@@ -94,8 +94,8 @@ class BCSRSPMMFunction(Function):
 
 class BCSRGraphConv(nn.Module):
     """
-    GraphSAGE-style Convolution with LayerNorm and Dropout.
-    H' = LayerNorm( ReLU( (A @ H @ W_neigh) + (H_self @ W_self) ) )
+    GraphSAGE-style Convolution (aggregation only).
+    Nonlinearities/normalization/dropout are handled at the model level.
     """
     def __init__(self, in_feats: int, out_feats: int, dropout: float = 0.5, warps_per_block: int = 8):
         super().__init__()
@@ -109,20 +109,11 @@ class BCSRGraphConv(nn.Module):
         self.weight_neigh = nn.Parameter(torch.Tensor(in_feats, out_feats))
         self.weight_self = nn.Parameter(torch.Tensor(in_feats, out_feats))
         
-        # [升级] 加入 LayerNorm 和 Activation
-        self.norm = nn.LayerNorm(out_feats)
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        
-        # Bias 可以集成在 Linear 变换中，或者单独加。LayerNorm 通常自带 bias。
-        # 这里为了简单，我们让 LayerNorm 处理 shift。
-        
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.weight_neigh)
         nn.init.xavier_uniform_(self.weight_self)
-        self.norm.reset_parameters()
 
     def forward(self, graph, features: torch.Tensor, features_target: torch.Tensor = None) -> torch.Tensor:
         """
@@ -196,16 +187,5 @@ class BCSRGraphConv(nn.Module):
         # -------------------------------------------------------
         # Merge: 合并两路特征
         # -------------------------------------------------------
-        # 1. Aggregation (Sum 等价于 Concat 后 Linear)
-        out = h_neigh + h_self
-        # 3. Activation
-        out = self.activation(out)
-        # 2. LayerNorm (关键升级!)
-        out = self.norm(out)
-        
-        
-        
-        # 4. Dropout
-        out = self.dropout(out)
-            
-        return out
+        # Aggregation (Sum 等价于 Concat 后 Linear)
+        return h_neigh + h_self
